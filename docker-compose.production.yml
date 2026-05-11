@@ -1,0 +1,33 @@
+version: '3.8'
+
+# Production stack — uses external PostgreSQL (e.g. Yandex Cloud Managed PostgreSQL).
+# DATABASE_URL must be set in the environment / .env on the host.
+
+services:
+  app:
+    build: .
+    container_name: neurocreatives
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      # Recommended for production: put StringSession in .env on the host.
+      # If TELEGRAM_SESSION_STRING is set, no .session file or volume is needed.
+      - TELEGRAM_SESSION_STRING=${TELEGRAM_SESSION_STRING:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - DATABASE_URL=${DATABASE_URL}
+      - HOST=0.0.0.0
+      - PORT=8000
+    volumes:
+      - ./downloads:/app/downloads
+      # Legacy fallback: bind-mount sessions directory if you still use a .session file.
+      # Not needed when TELEGRAM_SESSION_STRING is set.
+      - ./sessions:/app/sessions
+    networks:
+      - neurocreatives-network
+
+networks:
+  neurocreatives-network:
+    driver: bridge

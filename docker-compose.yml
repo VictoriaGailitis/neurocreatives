@@ -1,23 +1,56 @@
+version: '3.8'
+
+# Local development stack with PostgreSQL.
+# For production deployment use docker-compose.production.yml.
+
 services:
-  neurocreatives:
+  app:
     build: .
-    container_name: neurocreatives
+    container_name: neurocreatives-app
     restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
       - TELEGRAM_API_ID=${TELEGRAM_API_ID}
       - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - DATABASE_URL=${DATABASE_URL}
-      - CHANNELS_TO_PARSE=${CHANNELS_TO_PARSE}
+      # Optional: StringSession from .env (recommended). If set, the parser will
+      # use it instead of the ./sessions volume — no .session file needed.
+      - TELEGRAM_SESSION_STRING=${TELEGRAM_SESSION_STRING:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - DATABASE_URL=postgresql://neurocreatives:neurocreatives@db:5432/neurocreatives
+      - HOST=0.0.0.0
+      - PORT=8000
     volumes:
       - ./downloads:/app/downloads
-      - ./parser_session.session:/app/parser_session.session
-    dns:
-      - 8.8.8.8
-      - 8.8.4.4
-    network_mode: host
+      - ./sessions:/app/sessions
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - neurocreatives-network
+
+  db:
+    image: postgres:16-alpine
+    container_name: neurocreatives-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: neurocreatives
+      POSTGRES_USER: neurocreatives
+      POSTGRES_PASSWORD: neurocreatives
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neurocreatives -d neurocreatives"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - neurocreatives-network
+
+volumes:
+  postgres_data:
 
 networks:
   neurocreatives-network:

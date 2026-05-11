@@ -31,9 +31,33 @@
                     <span class="btn-icon">🔍</span>
                     Запустить анализ
                 </button>
+                <button id="btnClearDb" class="btn btn-danger" title="Удалить все посты, изображения и анализы из базы">
+                    <span class="btn-icon">🗑️</span>
+                    Очистить базу
+                </button>
             </div>
         </div>
     </header>
+
+    <!-- Глобальный статус-бар фоновых задач (всегда виден, даже без открытых логов) -->
+    <div id="jobStatusBar" class="job-status-bar" data-state="idle">
+        <div class="job-status-cell" data-job="parser">
+            <span class="job-status-icon" id="jobParserIcon">📡</span>
+            <span class="job-status-label">Парсер:</span>
+            <span class="job-status-text" id="jobParserText">Готов к запуску</span>
+            <span class="job-status-elapsed" id="jobParserElapsed"></span>
+        </div>
+        <div class="job-status-cell" data-job="analysis">
+            <span class="job-status-icon" id="jobAnalysisIcon">🔍</span>
+            <span class="job-status-label">Анализ:</span>
+            <span class="job-status-text" id="jobAnalysisText">Готов к запуску</span>
+            <span class="job-status-elapsed" id="jobAnalysisElapsed"></span>
+        </div>
+        <a href="#" class="job-status-link" id="jobStatusOpenLogs">Открыть логи →</a>
+    </div>
+
+    <!-- Контейнер для всплывающих уведомлений -->
+    <div id="toastContainer" class="toast-container" aria-live="polite"></div>
 
     <!-- Навигационные вкладки -->
     <div class="tabs-container">
@@ -62,11 +86,71 @@
     <!-- Блок фильтров -->
     <div id="filtersBar" class="filters-bar">
         <div class="filters-content">
+            <div class="filter-group" style="flex:1;min-width:240px">
+                <label class="filter-label">Поиск</label>
+                <input type="text" id="filterSearch" class="filter-input"
+                       placeholder="текст, сцена, тег, target description…">
+            </div>
             <div class="filter-group">
-                <label class="filter-label">Канал</label>
-                <select id="filterChannel" class="filter-select">
-                    <option value="">Все каналы</option>
+                <label class="filter-label" title="Удерживайте Ctrl / ⌘ для выбора нескольких тегов">Теги (мульти)</label>
+                <select id="filterTag" class="filter-select" multiple size="3">
+                    <option value="meme">meme</option>
+                    <option value="product_shot">product_shot</option>
+                    <option value="lifestyle">lifestyle</option>
+                    <option value="flat_lay">flat_lay</option>
+                    <option value="before_after">before_after</option>
+                    <option value="testimonial">testimonial</option>
+                    <option value="event">event</option>
+                    <option value="behind_scenes">behind_scenes</option>
+                    <option value="ugc">ugc</option>
+                    <option value="illustration">illustration</option>
+                    <option value="collage">collage</option>
+                    <option value="minimalist">minimalist</option>
                 </select>
+            </div>
+            <div class="filter-group">
+                <label class="filter-label">Модерация</label>
+                <select id="filterModeration" class="filter-select">
+                    <option value="">Любая</option>
+                    <option value="pending">pending</option>
+                    <option value="approved">approved</option>
+                    <option value="rejected">rejected</option>
+                </select>
+            </div>
+            <div class="filter-group" style="min-width:220px;">
+                <label class="filter-label">
+                    Каналы
+                    <span class="muted" style="font-weight:normal;font-size:11px;">
+                        (Ctrl/⌘ — несколько)
+                    </span>
+                </label>
+                <select id="filterChannel" class="filter-select" multiple size="3"
+                        style="min-height:64px;">
+                </select>
+            </div>
+            <div class="filter-group">
+                <label class="filter-label">За период</label>
+                <select id="filterDays" class="filter-select">
+                    <option value="">Все</option>
+                    <option value="1">1 день</option>
+                    <option value="3">3 дня</option>
+                    <option value="7" selected>7 дней</option>
+                    <option value="14">2 недели</option>
+                    <option value="30">30 дней</option>
+                    <option value="90">90 дней</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label class="filter-label" title="Только посты, потенциально подходящие под целевой креатив">
+                    <input type="checkbox" id="filterRelevantOnly">
+                    🎯 Только релевантные
+                </label>
+            </div>
+            <div class="filter-group">
+                <label class="filter-label" title="Объединять одинаковые креативы (по перцептивному хешу) и оставлять только самый популярный">
+                    <input type="checkbox" id="filterDedupe">
+                    🧬 Скрывать дубли
+                </label>
             </div>
             <div class="filter-group filter-group-with-hint">
                 <div class="filter-field">
@@ -243,6 +327,38 @@
                     </div>
                 </div>
 
+                <!-- Текущий статус фоновых задач (видно даже если логов в буфере нет) -->
+                <div class="job-status-panel">
+                    <div class="job-status-panel-card" id="jobStatusCardParser" data-state="idle">
+                        <div class="job-status-panel-head">
+                            <span class="job-status-panel-icon">📡</span>
+                            <span class="job-status-panel-title">Парсер</span>
+                            <span class="job-status-panel-badge" id="jobStatusCardParserBadge">Готов</span>
+                        </div>
+                        <div class="job-status-panel-msg" id="jobStatusCardParserMsg">Ожидание запуска</div>
+                        <div class="job-status-panel-meta">
+                            <span>Старт: <b id="jobStatusCardParserStarted">—</b></span>
+                            <span>Длительность: <b id="jobStatusCardParserDuration">—</b></span>
+                            <span>Тип: <b id="jobStatusCardParserType">—</b></span>
+                        </div>
+                        <div class="job-status-panel-error" id="jobStatusCardParserError" style="display:none;"></div>
+                    </div>
+                    <div class="job-status-panel-card" id="jobStatusCardAnalysis" data-state="idle">
+                        <div class="job-status-panel-head">
+                            <span class="job-status-panel-icon">🔍</span>
+                            <span class="job-status-panel-title">AI-анализ</span>
+                            <span class="job-status-panel-badge" id="jobStatusCardAnalysisBadge">Готов</span>
+                        </div>
+                        <div class="job-status-panel-msg" id="jobStatusCardAnalysisMsg">Ожидание запуска</div>
+                        <div class="job-status-panel-meta">
+                            <span>Старт: <b id="jobStatusCardAnalysisStarted">—</b></span>
+                            <span>Длительность: <b id="jobStatusCardAnalysisDuration">—</b></span>
+                            <span>Тип: <b id="jobStatusCardAnalysisType">—</b></span>
+                        </div>
+                        <div class="job-status-panel-error" id="jobStatusCardAnalysisError" style="display:none;"></div>
+                    </div>
+                </div>
+
                 <!-- Виджет статистики запусков -->
                 <div class="schedule-logs-widget">
                     <div class="schedule-logs-header">
@@ -396,18 +512,20 @@
                         </div>
 
                         <div class="guide-block">
-                            <h3>Вкладка 2: API ключ</h3>
-                            <p>Укажите ваш <strong>OpenAI API ключ</strong> для анализа изображений:</p>
+                            <h3>OpenAI API ключ</h3>
+                            <p>Ключ <strong>OpenAI API</strong> для анализа изображений задаётся
+                                <strong>только через переменную окружения</strong> <code>OPENAI_API_KEY</code>
+                                в файле <code>.env</code> на сервере.</p>
                             <ol>
                                 <li>Получите ключ на <a href="https://platform.openai.com/api-keys" target="_blank">https://platform.openai.com/api-keys</a></li>
-                                <li>Вставьте ключ в формате: <code>sk-...</code></li>
-                                <li>Нажмите <strong>"Сохранить"</strong></li>
+                                <li>Добавьте в <code>.env</code> строку: <code>OPENAI_API_KEY=sk-...</code></li>
+                                <li>Перезапустите сервис.</li>
                             </ol>
-                            <p class="warning">⚠️ Без ключа анализ изображений работать не будет.</p>
+                            <p class="warning">⚠️ Через интерфейс ключ задать нельзя — это сделано из соображений безопасности.</p>
                         </div>
 
                         <div class="guide-block">
-                            <h3>Вкладка 3: Промпт анализа</h3>
+                            <h3>Вкладка «Промпт анализа»</h3>
                             <p>Настройте, <strong>что именно</strong> AI будет анализировать на изображениях.</p>
                             <p><strong>Пример промпта:</strong></p>
                             <pre><code>Опиши это изображение для создания рекламного промпта.
@@ -577,86 +695,114 @@
             <!-- Вкладки настроек -->
             <div class="settings-tabs">
                 <button class="settings-tab active" data-tab="channels">Каналы</button>
-                <button class="settings-tab" data-tab="telegram">Telegram API</button>
-                <button class="settings-tab" data-tab="api">OpenAI API</button>
+                <button class="settings-tab" data-tab="filters">Фильтры каналов</button>
                 <button class="settings-tab" data-tab="prompt">Промпт анализа</button>
                 <button class="settings-tab" data-tab="scheduler">Планировщик</button>
             </div>
-            
-            <div class="modal-body" style="max-height: calc(80vh - 180px); overflow-y: auto;">
-                <!-- Вкладка: Каналы -->
+
+            <div class="modal-body">
+                <!-- Вкладка: Каналы (реестр — единственный источник правды) -->
                 <div id="settingsChannels" class="settings-panel active">
                     <p class="modal-description">
-                        Введите алиасы каналов (username без @), каждый с новой строки:
+                        Реестр каналов хранится в базе и переживает рестарт контейнера.
+                        Добавляйте по одному через «➕ Добавить канал», правьте алиас кнопкой ✎,
+                        удаляйте ненайденные — 🗑. Для массового добавления раскройте блок ниже.
                     </p>
-                    <textarea
-                        id="channelsTextarea"
-                        class="channels-textarea"
-                        placeholder="klientvsprav&#10;trendach&#10;sostav&#10;durov"
-                        rows="12"
-                    ></textarea>
-                    <div class="modal-info">
-                        <span id="channelsCount">0</span> каналов
-                    </div>
-                </div>
 
-                <!-- Вкладка: Telegram API -->
-                <div id="settingsTelegram" class="settings-panel">
-                    <p class="modal-description">
-                        Введите ваши Telegram API ключи для парсинга каналов. 
-                        Получите их на <a href="https://my.telegram.org" target="_blank">my.telegram.org</a>
-                    </p>
-                    <div class="form-group" style="margin-bottom: 16px;">
-                        <label class="form-label">API ID:</label>
-                        <input
-                            type="text"
-                            id="telegramApiIdInput"
-                            class="settings-input"
-                            placeholder="12345678"
-                        />
+                    <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap;">
+                        <button class="btn btn-primary" type="button" onclick="window.addChannelPrompt()">
+                            ➕ Добавить канал
+                        </button>
+                        <button class="btn btn-secondary" type="button" onclick="window.loadChannelRegistry()">
+                            🔄 Обновить реестр
+                        </button>
+                        <button id="btnEnrichChannels" class="btn btn-secondary" type="button" onclick="window.enrichChannels()">
+                            📊 Подтянуть статистику
+                        </button>
+                        <button class="btn btn-secondary" type="button" onclick="window.toggleBulkAdd()">
+                            📥 Массовое добавление
+                        </button>
+                        <span id="enrichStatusLabel" style="font-size:12px;color:var(--color-text-secondary);"></span>
                     </div>
-                    <div class="form-group" style="margin-bottom: 16px;">
-                        <label class="form-label">API Hash:</label>
-                        <input
-                            type="password"
-                            id="telegramApiHashInput"
-                            class="settings-input"
-                            placeholder="abc123def456..."
-                        />
-                        <button id="btnToggleTgApiHash" class="btn-toggle-password">👁️ Показать</button>
-                    </div>
-                    <div class="form-group" style="margin-bottom: 16px;">
-                        <label class="form-label">Сессия Telegram:</label>
-                        <div style="margin-top: 8px;">
-                            <button id="btnResetTgSession" class="btn btn-accent">
-                                🗑️ Сбросить сессию
+
+                    <!-- Скрытый блок массового добавления (append-only) -->
+                    <div id="bulkAddBlock" style="display:none;margin-bottom:14px;padding:12px;border:1px solid var(--color-border,#333);border-radius:6px;">
+                        <p class="modal-description" style="margin-top:0;">
+                            Вставьте список алиасов каналов (username без @), по одному в строке.
+                            Существующие записи не будут затронуты — только добавятся новые.
+                        </p>
+                        <textarea
+                            id="channelsTextarea"
+                            class="channels-textarea"
+                            placeholder="klientvsprav&#10;trendach&#10;sostav&#10;durov"
+                            rows="6"
+                        ></textarea>
+                        <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap;">
+                            <button class="btn btn-primary" type="button" onclick="window.bulkAddChannels()">
+                                Добавить в реестр
                             </button>
-                        </div>
-                        <div class="modal-info" style="margin-top: 8px;">
-                            ⚠️ Если ошибка "authorization key was used under two different IP addresses" — 
-                            сбросьте сессию и запустите парсер заново.
+                            <button class="btn btn-secondary" type="button" onclick="window.toggleBulkAdd(false)">
+                                Отмена
+                            </button>
+                            <span class="modal-info" style="margin-left:auto;">
+                                <span id="channelsCount">0</span> новых каналов
+                            </span>
                         </div>
                     </div>
-                    <div class="modal-info">
-                        API ключи сохраняются в базе данных
+
+                    <div id="channelRegistryList">
+                        <div class="loading">Загрузка реестра…</div>
                     </div>
                 </div>
 
-                <!-- Вкладка: OpenAI API ключ -->
-                <div id="settingsAPI" class="settings-panel">
+                <!-- Вкладка: Фильтры каналов -->
+                <div id="settingsFilters" class="settings-panel">
                     <p class="modal-description">
-                        Введите ваш API ключ OpenAI для анализа изображений:
+                        Кри­терии для авто-поиска и фильтрации Telegram-каналов:
                     </p>
-                    <input
-                        type="password"
-                        id="apiKeyInput"
-                        class="settings-input"
-                        placeholder="sk-..."
-                    />
-                    <button id="btnToggleApiKey" class="btn-toggle-password">👁️ Показать</button>
-                    <div class="modal-info">
-                        Ключ будет храниться в базе данных
+                    <div class="form-group">
+                        <label class="filter-label">Мин. подписчиков</label>
+                        <input type="number" id="cfMinSubs" class="settings-input" value="5000" min="0">
                     </div>
+                    <div class="form-group">
+                        <label class="filter-label">Мин. ER (%)</label>
+                        <input type="number" id="cfMinEr" class="settings-input" value="2.0" min="0" step="0.1">
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">
+                            <input type="checkbox" id="cfRequireReactions" checked>
+                            Только каналы с реакциями
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">Мин. постов в неделю</label>
+                        <input type="number" id="cfMinPpw" class="settings-input" value="1" min="0" step="0.5">
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">Ключевые слова для поиска (по одному на строку)</label>
+                        <textarea id="cfKeywords" class="channels-textarea" rows="6"
+                                  placeholder="marketing&#10;маркетинг&#10;реклама"></textarea>
+                    </div>
+                    <div class="form-group" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                        <button id="btnDiscoverChannels" class="btn btn-primary" type="button">🔎 Найти каналы</button>
+                        <span id="discoveryStatus" class="modal-info"></span>
+                    </div>
+                    <div id="discoveryProgressWrap" style="display:none;margin-top:10px;">
+                        <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--color-text-secondary);margin-bottom:4px;">
+                            <span id="discoveryProgressLabel">0 / 0 ключевых слов</span>
+                            <span id="discoveryProgressPercent">0%</span>
+                        </div>
+                        <div style="width:100%;height:8px;background:#eee;border-radius:4px;overflow:hidden;">
+                            <div id="discoveryProgressBar" style="height:100%;width:0%;background:#FFCC00;transition:width .3s;"></div>
+                        </div>
+                        <div style="margin-top:6px;font-size:12px;color:var(--color-text-secondary);">
+                            Проверено каналов: <b id="discoveryCheckedCount">0</b>,
+                            подходит: <b id="discoveryAcceptedCount">0</b>
+                        </div>
+                        <div id="discoveryEvents"
+                             style="margin-top:8px;max-height:180px;overflow:auto;font-family:monospace;font-size:12px;background:#fafafa;border:1px solid #eee;border-radius:4px;padding:6px;"></div>
+                    </div>
+                    <div id="discoveryResults" class="modal-info" style="margin-top:8px"></div>
                 </div>
 
                 <!-- Вкладка: Промпт анализа -->

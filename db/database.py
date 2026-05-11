@@ -2,9 +2,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
 from typing import Generator
+import logging
 import os
 
-from db.models import Base, Settings
+from db.models import Base, Settings, Channel
+from db.migrations import run_migrations
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
@@ -14,9 +18,14 @@ class Database:
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
     
     def create_tables(self):
-        """Создание всех таблиц в базе данных."""
+        """Создание всех таблиц в базе данных + применение лёгких миграций."""
         Base.metadata.create_all(bind=self.engine)
         print("✓ Таблицы созданы успешно")
+        try:
+            run_migrations(self.engine)
+            print("✓ Миграции схемы применены")
+        except Exception as exc:
+            logger.warning("Schema migrations failed: %s", exc)
     
     def drop_tables(self):
         """Удаление всех таблиц из базы данных."""
@@ -74,25 +83,93 @@ def get_db_session() -> Generator[Session, None, None]:
         yield session
 
 
+DEFAULT_SEARCH_KEYWORDS = (
+    "marketing\nмаркетинг\nSMM\nтаргет\n"
+    "бренд\nbranding\nайдентика\n"
+    "реклама\nadvertising\nкреатив\ncreative\nads\n"
+    "копирайтинг\nдизайн рекламы\nмедиабаинг\nperformance"
+)
+
+
 def init_default_settings():
-    """Инициализация настроек по умолчанию."""
+    """Идемпотентная инициализация настроек по умолчанию.
+
+    Создаёт только отсутствующие ключи — не затирает уже сохранённые
+    значения пользователя.
+    """
     db = get_database()
     with db.get_session() as session:
-        # Проверяем, есть ли уже настройки
-        existing_settings = session.query(Settings).first()
-        if existing_settings:
+        existing_keys = {row.key for row in session.query(Settings).all()}
+
+        defaults = {
+            # Prompt for image analysis (OpenAI API key is read from .env: OPENAI_API_KEY)
+            'analysis_prompt': 'Что на этом фото?',
+            # Channel filtering (Phase 2 / 7)
+            'channel_min_subscribers': '5000',
+            'channel_min_er': '2.0',
+            'channel_require_reactions': 'true',
+            'channel_min_posts_per_week': '1.0',
+            'channel_search_keywords': DEFAULT_SEARCH_KEYWORDS,
+            # AI image filtering (Phase 3)
+            'ai_filter_enabled': 'true',
+            'ai_min_solo_appeal': '4',
+            'ai_reject_text_screenshots': 'true',
+            'ai_reject_news_photos': 'true',
+            'ai_reject_unethical': 'true',
+        }
+
+        added = 0
+        for key, value in defaults.items():
+            if key not in existing_keys:
+                session.add(Settings(key=key, value=value))
+                added += 1
+
+        if added:
+            session.commit()
+            print(f"✓ Дефолтные настройки добавлены: +{added}")
+        else:
             print("✓ Настройки уже существуют")
-            return
-        
-        # Создаем настройки по умолчанию
-        # API ключ OpenAI берётся из переменной окружения
-        default_api_key = os.getenv('OPENAI_API_KEY', '')
-        
-        default_settings = [
-            Settings(key='openai_api_key', value=default_api_key),
-            Settings(key='analysis_prompt', value='Что на этом фото?'),
-        ]
-        
-        session.add_all(default_settings)
-        session.commit()
-        print("✓ Настройки по умолчанию созданы")
+
+
+def seed_channels_from_env(env_channels: list[str] | None) -> int:
+    """Однократно добавляет в реестр (`channels`) каналы из `.env` (CHANNELS_TO_PARSE).
+
+    Идемпотентно: если канал с таким `username` уже есть в БД — не трогаем его
+    (чтобы не «оживлять» удалённый пользователем канал). Возвращает количество
+    добавленных записей. После того как канал попал в БД — он становится
+    редактируемым через UI (вкл/выкл, переименование, удаление) и переживает
+    рестарт контейнера независимо от значения переменной окружения.
+    """
+    if not env_channels:
+        return 0
+    cleaned = [
+        (ch or '').strip().lstrip('@')
+        for ch in env_channels
+    ]
+    cleaned = [c for c in cleaned if c]
+    if not cleaned:
+        return 0
+
+    db = get_database()
+    added = 0
+    with db.get_session() as session:
+        existing = {
+            (u or '').lower()
+            for (u,) in session.query(Channel.username).all()
+        }
+        for ch in cleaned:
+            if ch.lower() in existing:
+                continue
+            session.add(Channel(
+                username=ch,
+                title=ch,
+                is_active=True,
+                discovered_via='manual',
+            ))
+            existing.add(ch.lower())
+            added += 1
+        if added:
+            session.commit()
+    if added:
+        print(f"✓ Каналы из .env добавлены в реестр: +{added}")
+    return added

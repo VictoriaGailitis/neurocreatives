@@ -14,11 +14,14 @@ let state = {
     sortColumn: null,
     sortDirection: 'asc',
     filters: {
-        channel: '',
+        channels: [],       // массив выбранных каналов (мультивыбор)
         erMin: null,
         erMax: null,
         viewsMin: null,
-        viewsMax: null
+        viewsMax: null,
+        days: null,         // показывать только посты за последние N дней
+        relevantOnly: false, // только потенциальные «целевые креативы»
+        dedupe: false       // схлопывать дубли по image_hash, оставляя самый популярный
     },
     logs: {
         eventSource: null,
@@ -175,9 +178,7 @@ async function saveScheduleSettings() {
             // Перезагружаем настройки для обновления статуса
             setTimeout(() => loadScheduleSettings(), 500);
         } else {
-            const detail = result.detail;
-            const errorMsg = typeof detail === 'string' ? detail : (Array.isArray(detail) ? detail.map(e => e.msg || JSON.stringify(e)).join('; ') : JSON.stringify(detail));
-            alert('Ошибка: ' + (errorMsg || 'Не удалось сохранить'));
+            alert('Ошибка: ' + (result.detail || 'Не удалось сохранить'));
         }
     } catch (error) {
         console.error('Ошибка при сохранении настроек планировщика:', error);
@@ -259,7 +260,8 @@ document.addEventListener('DOMContentLoaded', () => {
     loadCreatives();
     initEventListeners();
     initTabSwitching();
-    
+    initJobStatusPolling();
+
     // Обновляем статистику каждые 5 секунд
     setInterval(loadStats, 5000);
 });
@@ -268,6 +270,8 @@ document.addEventListener('DOMContentLoaded', () => {
 function initEventListeners() {
     document.getElementById('btnRunParser').addEventListener('click', runParser);
     document.getElementById('btnRunAnalysis').addEventListener('click', runAnalysis);
+    const btnClear = document.getElementById('btnClearDb');
+    if (btnClear) btnClear.addEventListener('click', clearCreativesDb);
     document.getElementById('btnRefresh').addEventListener('click', refreshCreatives);
     document.getElementById('btnLoadMore').addEventListener('click', loadMoreCreatives);
     document.getElementById('btnCloseDetail').addEventListener('click', closeDetailPanel);
@@ -327,15 +331,6 @@ function initEventListeners() {
             switchSettingsTab(e.target.dataset.tab);
         });
     });
-    
-    // Показать/скрыть API ключ
-    document.getElementById('btnToggleApiKey').addEventListener('click', toggleApiKeyVisibility);
-    
-    // Telegram API Hash: показать/скрыть
-    document.getElementById('btnToggleTgApiHash').addEventListener('click', toggleTgApiHashVisibility);
-    
-    // Сброс сессии Telegram
-    document.getElementById('btnResetTgSession').addEventListener('click', resetTgSession);
     
     // Логи
     document.getElementById('btnPauseLogs').addEventListener('click', toggleLogsPause);
@@ -462,26 +457,28 @@ function renderChannels(channels) {
     `).join('');
 }
 
-// Обновление выпадающего списка каналов для фильтра
+// Обновление выпадающего списка каналов для фильтра.
+// Это <select multiple>, поэтому одиночной "Все каналы"-опции уже нет —
+// «все» = ничего не выбрано. Сохраняем ранее выбранные каналы.
 function updateChannelsFilter(channels) {
     const select = document.getElementById('filterChannel');
-    const currentValue = select.value;
-    
-    // Очищаем и заполняем заново
-    select.innerHTML = '<option value="">Все каналы</option>';
-    
+    if (!select) return;
+    const previouslySelected = new Set(
+        Array.from(select.selectedOptions || []).map(o => o.value)
+    );
+    // Если пользователь явно проставлял каналы через state — учитываем и их,
+    // чтобы выбор не сбрасывался при обновлении списка по таймеру.
+    (state.filters?.channels || []).forEach(c => previouslySelected.add(c));
+
+    select.innerHTML = '';
     if (channels && channels.length > 0) {
         channels.forEach(channel => {
             const option = document.createElement('option');
             option.value = channel;
             option.textContent = channel;
+            if (previouslySelected.has(channel)) option.selected = true;
             select.appendChild(option);
         });
-    }
-    
-    // Восстанавливаем выбранное значение если оно было
-    if (currentValue) {
-        select.value = currentValue;
     }
 }
 
@@ -506,32 +503,99 @@ async function loadCreatives(append = false) {
             limit: state.limit,
             offset: append ? state.offset : 0
         });
-        
+
+        // Каналы: либо одиночный из сайдбара, либо мультивыбор из верхнего фильтра.
+        // Передаём через запятую — бэкенд понимает оба варианта.
+        const filterChannels = (state.filters && state.filters.channels) || [];
+        let channelsParam = '';
         if (state.selectedChannel) {
-            params.append('channel', state.selectedChannel);
+            channelsParam = state.selectedChannel;
+        } else if (filterChannels.length > 0) {
+            channelsParam = filterChannels.join(',');
         }
-        
+        if (channelsParam) {
+            params.append('channel', channelsParam);
+        }
+
+        if (state.filters?.relevantOnly) {
+            params.append('relevant_only', 'true');
+        }
+        if (state.filters?.days) {
+            params.append('days', String(state.filters.days));
+        }
+        if (state.filters?.dedupe) {
+            params.append('dedupe', 'true');
+        }
+
         const response = await fetch(`/api/creatives?${params}`);
         const data = await response.json();
-        
+
+        let creatives = data.creatives || [];
+
+        // Клиентские фильтры (ER / просмотры) — серверный API их не знает.
+        creatives = applyClientFilters(creatives);
+
         if (append) {
-            state.creatives = [...state.creatives, ...data.creatives];
+            state.creatives = [...state.creatives, ...creatives];
         } else {
-            state.creatives = data.creatives;
+            state.creatives = creatives;
             state.offset = 0;
         }
-        
-        state.offset += data.creatives.length;
-        state.hasMore = state.offset < data.total;
-        
+
+        state.offset += (data.creatives || []).length;
+        state.hasMore = state.offset < (data.total || 0);
+
         renderCreatives();
-        
+
     } catch (error) {
         console.error('Ошибка загрузки креативов:', error);
         document.getElementById('creativesGrid').innerHTML = `
             <div class="loading">Ошибка загрузки креативов</div>
         `;
     }
+}
+
+// Клиентская фильтрация по ER / просмотрам / каналу / дате / релевантности.
+// Используется и галереей, и таблицей.
+function applyClientFilters(items) {
+    const f = state.filters || {};
+    const channels = Array.isArray(f.channels) ? f.channels : [];
+    let cutoffMs = null;
+    if (f.days) {
+        cutoffMs = Date.now() - Number(f.days) * 86400000;
+    }
+    return (items || []).filter(c => {
+        if (channels.length > 0 && !channels.includes(c.channel)) return false;
+        const er = c.er || 0;
+        if (f.erMin != null && er < f.erMin) return false;
+        if (f.erMax != null && er > f.erMax) return false;
+        const views = c.views || 0;
+        if (f.viewsMin != null && views < f.viewsMin) return false;
+        if (f.viewsMax != null && views > f.viewsMax) return false;
+        if (cutoffMs != null && c.date) {
+            const d = new Date(c.date).getTime();
+            if (!isNaN(d) && d < cutoffMs) return false;
+        }
+        if (f.relevantOnly) {
+            if (!isRelevantCreative(c)) return false;
+        }
+        return true;
+    });
+}
+
+// Совпадает по смыслу с серверным `_relevant_creative_filter`.
+// Используется при клиентской фильтрации уже загруженных табличных данных.
+function isRelevantCreative(c) {
+    const a = c && c.analysis;
+    if (!a) return false;
+    if (a.is_ad_creative !== true) return false;
+    if (a.is_text_screenshot === true) return false;
+    if (a.is_news_photo === true) return false;
+    if (a.ethics_flag === true) return false;
+    if (a.moderation_status === 'rejected') return false;
+    const appeal = a.solo_image_appeal;
+    if (appeal != null && appeal < 4) return false;
+    return true;
 }
 
 // Отрисовка креативов
@@ -545,14 +609,39 @@ function renderCreatives() {
     }
     
     container.innerHTML = state.creatives.map(creative => {
-        const emotion = creative.analysis?.emotion || '';
+        const a = creative.analysis || {};
+        const emotion = a.emotion || '';
         const er = creative.er || 0;
         const imagePath = creative.image?.file_path || '';
-        
+        const tags = Array.isArray(a.tags) ? a.tags : [];
+        const citationCount = creative.citation_count || 0;
+        const duplicateCount = creative.duplicate_count || 0;
+        const moderation = a.moderation_status || '';
+
+        const badges = [];
+        if (citationCount > 0) {
+            badges.push(`<span class="card-badge badge-citation" title="Найдено цитирований в других каналах">🔁 ${citationCount}</span>`);
+        }
+        if (duplicateCount > 0) {
+            const dupTitle = `Скрыто дублей того же креатива: ${duplicateCount}. Кликните «Показать дубли» в детальной панели.`;
+            badges.push(`<span class="card-badge badge-duplicates" title="${dupTitle}">🧬 +${duplicateCount}</span>`);
+        }
+        if (moderation === 'approved') {
+            badges.push(`<span class="card-badge badge-approved" title="Одобрено">✓</span>`);
+        } else if (moderation === 'rejected') {
+            badges.push(`<span class="card-badge badge-rejected" title="Отклонено">✕</span>`);
+        }
+
+        const tagChips = tags.slice(0, 3).map(t => `<span class="tag">${t}</span>`).join('');
+        const emotionChip = emotion ? `<span class="tag tag-emotion">${emotion}</span>` : '';
+
         return `
             <div class="creative-card" onclick="openCreativeDetail(${creative.id})">
-                <img src="${resolveImageUrl(imagePath)}" alt="${creative.channel}" class="creative-image" 
-                     onerror="this.src='/static/placeholder.png'">
+                <div class="creative-image-wrap">
+                    <img src="/${imagePath}" alt="${creative.channel}" class="creative-image"
+                         onerror="this.src='/static/placeholder.png'">
+                    ${badges.length ? `<div class="card-badges">${badges.join('')}</div>` : ''}
+                </div>
                 <div class="creative-content">
                     <div class="creative-channel">${creative.channel}</div>
                     <div class="creative-text">${truncateText(creative.text, 100)}</div>
@@ -566,10 +655,8 @@ function renderCreatives() {
                             <span class="meta-value">${formatNumber(creative.views)}</span>
                         </div>
                     </div>
-                    ${emotion ? `
-                        <div class="creative-tags">
-                            <span class="tag">${emotion}</span>
-                        </div>
+                    ${(tagChips || emotionChip) ? `
+                        <div class="creative-tags">${tagChips}${emotionChip}</div>
                     ` : ''}
                 </div>
             </div>
@@ -596,7 +683,7 @@ async function openCreativeDetail(creativeId) {
         const analysis = image?.analysis;
         
         content.innerHTML = `
-            <img src="${resolveImageUrl(image.file_path)}" alt="${creative.channel}" class="detail-image"
+            <img src="/${image.file_path}" alt="${creative.channel}" class="detail-image"
                  onerror="this.src='/static/placeholder.png'">
             
             <div class="detail-section">
@@ -618,7 +705,34 @@ async function openCreativeDetail(creativeId) {
                     </div>
                 </div>
             </div>
-            
+
+            ${(() => {
+                // Если в текущей ленте этот пост был «лидером» группы дублей,
+                // показываем список вытесненных постов с их ER/каналом.
+                const cached = (state.creatives || []).find(c => c.id === creativeId);
+                const dups = (cached && Array.isArray(cached.duplicates)) ? cached.duplicates : [];
+                if (!dups.length) return '';
+                const rows = dups.map(d => `
+                    <li class="duplicate-row">
+                        <a href="${d.post_url || '#'}" target="_blank">${d.channel}</a>
+                        <span>· ER ${d.er}%</span>
+                        <span>· 👁 ${formatNumber(d.views || 0)}</span>
+                        <span class="muted">· ${formatDateShort(d.date)}</span>
+                    </li>
+                `).join('');
+                return `
+                <div class="detail-section">
+                    <div class="detail-title">🧬 Дубли этого креатива (${dups.length})</div>
+                    <p class="muted" style="margin:4px 0 8px 0;font-size:12px;">
+                        Этот пост — наиболее популярный из найденных дублей того же изображения.
+                        Менее популярные копии скрыты из ленты:
+                    </p>
+                    <ul class="duplicate-list" style="list-style:none;padding-left:0;margin:0;">
+                        ${rows}
+                    </ul>
+                </div>`;
+            })()}
+
             <div class="detail-section">
                 <div class="detail-title">Текст поста</div>
                 <div class="detail-field-value">${creative.text}</div>
@@ -649,38 +763,183 @@ async function openCreativeDetail(creativeId) {
             </div>
             
             ${analysis ? `
+                ${(() => {
+                    // Stage-1 классификация запущена, только если is_ad_creative
+                    // или image_is_key_factor НЕ null. Иначе все «Нет» — это
+                    // дефолтные значения колонок, которые лучше показывать как «—».
+                    const stage1Run = (
+                        analysis.is_ad_creative !== null && analysis.is_ad_creative !== undefined
+                    ) || (
+                        analysis.image_is_key_factor !== null && analysis.image_is_key_factor !== undefined
+                    );
+                    const dash = '<span class="badge badge-neutral">—</span>';
+                    const triBool = (val, yesYes, yesNo) => {
+                        if (!stage1Run) return dash;
+                        if (val === true) return yesYes;
+                        if (val === false) return yesNo;
+                        return dash;
+                    };
+                    return `
                 <div class="detail-section">
-                    <div class="detail-title">AI Анализ</div>
+                    <div class="detail-title">🔍 Этап 1: Классификация ${stage1Run ? '' : '<span class="muted" style="font-size:11px">(не выполнена)</span>'}</div>
                     <div class="detail-field">
-                        <div class="detail-field-label">Тип креатива</div>
-                        <div class="detail-field-value">${analysis.creative_type}</div>
+                        <div class="detail-field-label">Рекламный креатив</div>
+                        <div class="detail-field-value">${triBool(analysis.is_ad_creative,
+                            '<span class="badge badge-success">✓ Да</span>',
+                            '<span class="badge badge-danger">✕ Нет</span>')}</div>
                     </div>
                     <div class="detail-field">
+                        <div class="detail-field-label">Скриншот текста</div>
+                        <div class="detail-field-value">${triBool(analysis.is_text_screenshot,
+                            '<span class="badge badge-warning">⚠️ Да</span>',
+                            '<span class="badge badge-success">✓ Нет</span>')}</div>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-field-label">Новостное фото</div>
+                        <div class="detail-field-value">${triBool(analysis.is_news_photo,
+                            '<span class="badge badge-warning">⚠️ Да</span>',
+                            '<span class="badge badge-success">✓ Нет</span>')}</div>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-field-label">Инфографика</div>
+                        <div class="detail-field-value">${triBool(analysis.is_infographic,
+                            '<span class="badge badge-info">📊 Да</span>',
+                            '<span class="badge badge-success">✓ Нет</span>')}</div>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-field-label">Логотип бренда</div>
+                        <div class="detail-field-value">${triBool(analysis.has_brand_logo,
+                            '<span class="badge badge-info">🏷️ Да</span>',
+                            '<span class="badge badge-success">✓ Нет</span>')}</div>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-field-label">Текст поверх изображения</div>
+                        <div class="detail-field-value">${triBool(analysis.has_overlay_text,
+                            '<span class="badge badge-info">📝 Да</span>',
+                            '<span class="badge badge-success">✓ Нет</span>')}</div>
+                    </div>
+                    <div class="detail-field">
+                        <div class="detail-field-label">Этические флаги</div>
+                        <div class="detail-field-value">${triBool(analysis.ethics_flag,
+                            '<span class="badge badge-danger">⛔ Да</span>',
+                            '<span class="badge badge-success">✓ Нет</span>')}
+                        </div>
+                    </div>
+                    ${analysis.ethics_reason ? `
+                    <div class="detail-field">
+                        <div class="detail-field-label">Причина этического флага</div>
+                        <div class="detail-field-value">${escapeHtml(analysis.ethics_reason)}</div>
+                    </div>` : ''}
+                    <div class="detail-field">
+                        <div class="detail-field-label">Изображение - ключевой фактор</div>
+                        <div class="detail-field-value">
+                            ${analysis.image_is_key_factor === true ? '<span class="badge badge-success">✓ Да</span>' :
+                              analysis.image_is_key_factor === false ? '<span class="badge badge-danger">✕ Нет</span>' :
+                              '<span class="badge badge-neutral">—</span>'}
+                        </div>
+                    </div>
+                    ${analysis.solo_image_appeal != null ? `
+                    <div class="detail-field">
+                        <div class="detail-field-label">Solo Image Appeal</div>
+                        <div class="detail-field-value">
+                            <span class="score-badge ${analysis.solo_image_appeal >= 7 ? 'score-high' : analysis.solo_image_appeal >= 4 ? 'score-medium' : 'score-low'}">
+                                ${analysis.solo_image_appeal}/10
+                            </span>
+                        </div>
+                    </div>` : ''}
+                </div>`;
+                })()}
+
+                <div class="detail-section">
+                    <div class="detail-title">🎨 Этап 2: Полный анализ</div>
+                    <div class="detail-field">
+                        <div class="detail-field-label">Тип креатива</div>
+                        <div class="detail-field-value">${analysis.creative_type || '—'}</div>
+                    </div>
+                    ${Array.isArray(analysis.tags) && analysis.tags.length ? `
+                    <div class="detail-field">
+                        <div class="detail-field-label">Теги</div>
+                        <div class="detail-field-value">
+                            ${analysis.tags.map(t => `<span class="tag">${t}</span>`).join(' ')}
+                        </div>
+                    </div>` : ''}
+                    <div class="detail-field">
                         <div class="detail-field-label">Сцена</div>
-                        <div class="detail-field-value">${analysis.scene}</div>
+                        <div class="detail-field-value">${analysis.scene || '—'}</div>
                     </div>
                     <div class="detail-field">
                         <div class="detail-field-label">Объекты</div>
-                        <div class="detail-field-value">${analysis.objects}</div>
+                        <div class="detail-field-value">${analysis.objects || '—'}</div>
                     </div>
                     <div class="detail-field">
                         <div class="detail-field-label">Эмоция</div>
-                        <div class="detail-field-value">${analysis.emotion}</div>
+                        <div class="detail-field-value">${analysis.emotion || '—'}</div>
                     </div>
                     <div class="detail-field">
                         <div class="detail-field-label">Текст присутствует</div>
-                        <div class="detail-field-value">${analysis.text_present}</div>
+                        <div class="detail-field-value">${analysis.text_present ? 'да' : 'нет'}</div>
                     </div>
                     <div class="detail-field">
                         <div class="detail-field-label">Визуальная сила</div>
-                        <div class="detail-field-value">${analysis.visual_strength_score}/10</div>
+                        <div class="detail-field-value">${analysis.visual_strength_score || 0}/10</div>
+                    </div>
+                    ${analysis.solo_appeal_score != null ? `
+                    <div class="detail-field">
+                        <div class="detail-field-label">Solo appeal</div>
+                        <div class="detail-field-value">${analysis.solo_appeal_score}/10</div>
+                    </div>` : ''}
+                </div>
+
+                <div class="detail-section">
+                    <div class="detail-title">🎯 Target Description (для генерации)</div>
+                    <div id="targetDescriptionBlock" class="detail-field-value detail-target-description">
+                        ${analysis.target_description ? escapeHtml(analysis.target_description) : '<span class="muted">не сгенерировано</span>'}
+                    </div>
+                    <div class="detail-actions" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
+                        <button class="btn btn-secondary" type="button" onclick="generateTargetDescription(${creative.id})">
+                            ${analysis.target_description ? '🔁 Перегенерировать' : '✨ Сгенерировать'}
+                        </button>
+                        ${analysis.target_description ? `<button class="btn btn-secondary" type="button" onclick="copyTargetDescription(${creative.id})">📋 Копировать</button>` : ''}
+                    </div>
+                </div>
+
+                <div class="detail-section">
+                    <div class="detail-title">🛡️ Модерация</div>
+                    <div class="detail-field">
+                        <div class="detail-field-label">Статус</div>
+                        <div class="detail-field-value">
+                            <span class="moderation-badge moderation-${analysis.moderation_status || 'pending'}">
+                                ${moderationLabel(analysis.moderation_status)}
+                            </span>
+                        </div>
+                    </div>
+                    ${analysis.moderation_comment ? `
+                    <div class="detail-field">
+                        <div class="detail-field-label">Комментарий / причина</div>
+                        <div class="detail-field-value">${escapeHtml(analysis.moderation_comment)}</div>
+                    </div>` : ''}
+                    <div class="detail-actions" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
+                        <button class="btn btn-primary" type="button" onclick="moderateCreative(${creative.id}, 'approved')">✓ Одобрить</button>
+                        <button class="btn btn-accent" type="button" onclick="moderateCreative(${creative.id}, 'rejected')">✕ Отклонить</button>
+                        <button class="btn btn-secondary" type="button" onclick="moderateCreative(${creative.id}, 'pending')">↺ Сбросить</button>
+                        <button class="btn btn-secondary" type="button" onclick="reanalyzeCreative(${creative.id})" title="Перезапустить классификацию и анализ для этого изображения">🔄 Переанализировать</button>
                     </div>
                 </div>
             ` : '<div class="detail-section"><div class="loading">Анализ еще не выполнен</div></div>'}
+
+            <div class="detail-section">
+                <div class="detail-title">🔁 Цитирования в других каналах
+                    <span class="muted" style="font-weight:normal">(${creative.citation_count || 0})</span>
+                </div>
+                <div id="citationsBlock" class="detail-field-value">
+                    <div class="loading">Загрузка…</div>
+                </div>
+            </div>
         `;
-        
+
         panel.classList.add('open');
-        
+        loadCitations(creative.id);
+
     } catch (error) {
         console.error('Ошибка загрузки деталей:', error);
     }
@@ -720,26 +979,28 @@ function loadMoreCreatives() {
 async function runParser() {
     const btn = document.getElementById('btnRunParser');
     btn.disabled = true;
-    
+
     try {
         const response = await fetch('/api/run-parser', { method: 'POST' });
         const data = await response.json();
-        
-        alert(data.message);
-        
-        // Обновляем данные через 2 секунды
-        setTimeout(() => {
-            loadStats();
-            refreshCreatives();
-        }, 2000);
-        
+
+        if (data.status === 'already_running') {
+            showToast('warn', '📡 Парсер уже запущен', data.message || '');
+        } else {
+            showToast('info', '📡 Парсер запущен', data.message || '');
+        }
+
+        // Сразу обновляем индикаторы — не ждём 5-секундный setInterval
+        await refreshJobStatus();
+        loadStats();
+
     } catch (error) {
         console.error('Ошибка запуска парсера:', error);
-        alert('Ошибка запуска парсера');
+        showToast('error', 'Ошибка запуска парсера', String(error));
     } finally {
-        setTimeout(() => {
-            btn.disabled = false;
-        }, 3000);
+        // Финальное состояние кнопки определяется циклом polling по running-флагу,
+        // здесь просто разблокируем — повторный клик заблокируется на сервере.
+        btn.disabled = false;
     }
 }
 
@@ -747,43 +1008,308 @@ async function runParser() {
 async function runAnalysis() {
     const btn = document.getElementById('btnRunAnalysis');
     btn.disabled = true;
-    
+
     try {
         const response = await fetch('/api/run-analysis', { method: 'POST' });
         const data = await response.json();
-        
-        alert(data.message);
-        
-        // Обновляем данные через 2 секунды
-        setTimeout(() => {
-            loadStats();
-            refreshCreatives();
-        }, 2000);
-        
+
+        if (data.status === 'already_running') {
+            showToast('warn', '🔍 Анализ уже запущен', data.message || '');
+        } else {
+            showToast('info', '🔍 Анализ запущен', data.message || '');
+        }
+
+        await refreshJobStatus();
+        loadStats();
+
     } catch (error) {
         console.error('Ошибка запуска анализа:', error);
-        alert('Ошибка запуска анализа');
+        showToast('error', 'Ошибка запуска анализа', String(error));
     } finally {
-        setTimeout(() => {
-            btn.disabled = false;
-        }, 3000);
+        btn.disabled = false;
     }
 }
 
-// Утилиты
+// Полная очистка базы креативов (посты, изображения, анализы, цитирования + локальные файлы)
+async function clearCreativesDb() {
+    const btn = document.getElementById('btnClearDb');
+    if (!btn) return;
 
-/**
- * Преобразует file_path из API в пригодный для <img src> URL.
- * Если path — абсолютный URL (http/https), возвращает как есть.
- * Иначе добавляет ведущий «/» для относительного пути.
- */
-function resolveImageUrl(path) {
-    if (!path) return '/static/placeholder.png';
-    if (path.startsWith('http://') || path.startsWith('https://')) return path;
-    // Убираем двойной leading slash если он уже есть
-    return '/' + path.replace(/^\/+/, '');
+    const confirm1 = window.confirm(
+        'Вы уверены, что хотите ОЧИСТИТЬ базу креативов?\n\n' +
+        'Будут удалены ВСЕ:\n' +
+        '— посты\n— изображения (включая файлы в downloads/)\n— результаты анализа\n— цитирования\n\n' +
+        'Каналы и настройки сохранятся. Действие необратимо.'
+    );
+    if (!confirm1) return;
+
+    const typed = window.prompt('Для подтверждения введите слово CLEAR (заглавными):', '');
+    if ((typed || '').trim().toUpperCase() !== 'CLEAR') {
+        showToast('warn', 'Очистка отменена', 'Подтверждение не введено');
+        return;
+    }
+
+    btn.disabled = true;
+    const original = btn.innerHTML;
+    btn.innerHTML = '<span class="btn-icon">⏳</span> Очистка…';
+
+    try {
+        const response = await fetch('/api/creatives/clear', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ confirm: 'CLEAR', delete_files: true })
+        });
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.detail || 'HTTP ' + response.status);
+        }
+
+        const d = data.deleted || {};
+        showToast(
+            'info',
+            '🗑️ База очищена',
+            `Удалено: постов ${d.posts || 0}, изображений ${d.images || 0}, ` +
+            `анализов ${d.analyses || 0}, цитирований ${d.citations || 0}, ` +
+            `файлов ${d.files_deleted || 0}`
+        );
+
+        // Перезагружаем UI
+        await loadStats();
+        await loadCreatives();
+        if (typeof loadTable === 'function') loadTable();
+    } catch (error) {
+        console.error('Ошибка очистки базы:', error);
+        showToast('error', 'Ошибка очистки', String(error.message || error));
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = original;
+    }
 }
 
+// =====================================================================
+// Job status: статус-бар, карточки в логах, кнопки, тосты
+// =====================================================================
+
+// Хранит последний снимок состояния и таймеры
+state.jobStatus = {
+    parser: null,
+    analysis: null,
+    pollTimer: null,
+    tickerTimer: null,
+    // Чтобы тостить «Завершено» только один раз на каждый запуск
+    lastFinishedAtToasted: { parser: null, analysis: null },
+    // Чтобы при первом приходе данных не плеваться тостами «Завершено» из истории
+    primed: false,
+};
+
+function initJobStatusPolling() {
+    // Клик на ссылку «Открыть логи →»
+    const link = document.getElementById('jobStatusOpenLogs');
+    if (link) {
+        link.addEventListener('click', (e) => {
+            e.preventDefault();
+            switchTab('logs');
+        });
+    }
+
+    // Сразу подтягиваем статус, далее регулярные опросы
+    refreshJobStatus();
+    state.jobStatus.pollTimer = setInterval(refreshJobStatus, 2000);
+
+    // Локальный «тикер» для секундной анимации elapsed-времени без обращения к серверу
+    state.jobStatus.tickerTimer = setInterval(updateElapsedCounters, 1000);
+}
+
+async function refreshJobStatus() {
+    try {
+        const res = await fetch('/api/job-status');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        applyJobStatus('parser', data.parser);
+        applyJobStatus('analysis', data.analysis);
+        state.jobStatus.primed = true;
+    } catch (err) {
+        // Сетевая ошибка — обновим статус-бар индикатором
+        const bar = document.getElementById('jobStatusBar');
+        if (bar) bar.dataset.state = 'offline';
+        const t1 = document.getElementById('jobParserText');
+        const t2 = document.getElementById('jobAnalysisText');
+        if (t1) t1.textContent = 'Нет связи с сервером';
+        if (t2) t2.textContent = 'Нет связи с сервером';
+    }
+}
+
+function applyJobStatus(kind, snap) {
+    if (!snap) return;
+    const prev = state.jobStatus[kind];
+    state.jobStatus[kind] = snap;
+
+    // Вычисляем визуальный state
+    let stateName = 'idle';
+    if (snap.running) stateName = 'running';
+    else if (snap.last_status === 'error') stateName = 'error';
+    else if (snap.last_status === 'success') stateName = 'success';
+
+    // Status-bar (top)
+    const cell = document.querySelector(`.job-status-cell[data-job="${kind}"]`);
+    if (cell) cell.dataset.state = stateName;
+    const textEl = document.getElementById(kind === 'parser' ? 'jobParserText' : 'jobAnalysisText');
+    if (textEl) textEl.textContent = snap.message || '—';
+    const iconEl = document.getElementById(kind === 'parser' ? 'jobParserIcon' : 'jobAnalysisIcon');
+    if (iconEl) iconEl.textContent = snap.running ? '⏳' : (kind === 'parser' ? '📡' : '🔍');
+
+    // Bar global state (running доминирует)
+    const bar = document.getElementById('jobStatusBar');
+    if (bar) {
+        const anyRunning = state.jobStatus.parser?.running || state.jobStatus.analysis?.running;
+        const anyError = state.jobStatus.parser?.last_status === 'error' || state.jobStatus.analysis?.last_status === 'error';
+        bar.dataset.state = anyRunning ? 'running' : (anyError ? 'error' : 'idle');
+    }
+
+    // Карточка во вкладке Логи
+    const cap = kind === 'parser' ? 'Parser' : 'Analysis';
+    const card = document.getElementById(`jobStatusCard${cap}`);
+    const badge = document.getElementById(`jobStatusCard${cap}Badge`);
+    const msg = document.getElementById(`jobStatusCard${cap}Msg`);
+    const started = document.getElementById(`jobStatusCard${cap}Started`);
+    const duration = document.getElementById(`jobStatusCard${cap}Duration`);
+    const typeEl = document.getElementById(`jobStatusCard${cap}Type`);
+    const errEl = document.getElementById(`jobStatusCard${cap}Error`);
+    if (card) card.dataset.state = stateName;
+    if (badge) {
+        if (snap.running) { badge.textContent = '⏳ Выполняется'; }
+        else if (snap.last_status === 'error') { badge.textContent = '✖ Ошибка'; }
+        else if (snap.last_status === 'success') { badge.textContent = '✓ Завершено'; }
+        else { badge.textContent = 'Готов'; }
+    }
+    if (msg) msg.textContent = snap.message || '—';
+    if (started) started.textContent = snap.started_at ? formatLocalTime(snap.started_at) : '—';
+    if (duration) {
+        if (snap.running && snap.started_at) {
+            duration.textContent = formatElapsed(elapsedSecondsFromIso(snap.started_at));
+        } else if (snap.duration_seconds != null) {
+            duration.textContent = formatElapsed(snap.duration_seconds);
+        } else {
+            duration.textContent = '—';
+        }
+    }
+    if (typeEl) typeEl.textContent = snap.run_type || '—';
+    if (errEl) {
+        if (snap.last_error && !snap.running) {
+            errEl.style.display = 'block';
+            errEl.textContent = '⚠ ' + snap.last_error;
+        } else {
+            errEl.style.display = 'none';
+            errEl.textContent = '';
+        }
+    }
+
+    // Кнопки в шапке: блокируем во время выполнения
+    if (kind === 'parser') {
+        const btn = document.getElementById('btnRunParser');
+        if (btn) btn.disabled = !!snap.running;
+    } else {
+        const btn = document.getElementById('btnRunAnalysis');
+        if (btn) btn.disabled = !!snap.running;
+    }
+
+    // Тост о завершении (только при переходе running -> not running, и не из истории)
+    if (state.jobStatus.primed && prev && prev.running && !snap.running) {
+        const finishedAt = snap.finished_at || '';
+        if (state.jobStatus.lastFinishedAtToasted[kind] !== finishedAt) {
+            state.jobStatus.lastFinishedAtToasted[kind] = finishedAt;
+            const title = (kind === 'parser' ? '📡 Парсер' : '🔍 Анализ');
+            if (snap.last_status === 'error') {
+                showToast('error', title + ' завершён с ошибкой', snap.last_error || snap.message || '');
+            } else {
+                showToast('success', title + ' завершён', snap.message || '');
+                // Подтягиваем свежие данные после успешного запуска
+                loadStats();
+                if (typeof refreshCreatives === 'function') refreshCreatives();
+            }
+        }
+    }
+}
+
+function updateElapsedCounters() {
+    ['parser', 'analysis'].forEach((kind) => {
+        const snap = state.jobStatus[kind];
+        if (!snap || !snap.running || !snap.started_at) {
+            const el = document.getElementById(kind === 'parser' ? 'jobParserElapsed' : 'jobAnalysisElapsed');
+            if (el) el.textContent = '';
+            return;
+        }
+        const sec = elapsedSecondsFromIso(snap.started_at);
+        const el = document.getElementById(kind === 'parser' ? 'jobParserElapsed' : 'jobAnalysisElapsed');
+        if (el) el.textContent = '· ' + formatElapsed(sec);
+        const cap = kind === 'parser' ? 'Parser' : 'Analysis';
+        const dur = document.getElementById(`jobStatusCard${cap}Duration`);
+        if (dur) dur.textContent = formatElapsed(sec);
+    });
+}
+
+function elapsedSecondsFromIso(iso) {
+    try {
+        // Сервер шлёт UTC ISO без таймзоны — добавим Z
+        const d = new Date(iso.endsWith('Z') ? iso : iso + 'Z');
+        return Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
+    } catch (_) {
+        return 0;
+    }
+}
+
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function formatElapsed(seconds) {
+    if (seconds == null || isNaN(seconds)) return '—';
+    const s = Math.round(Number(seconds));
+    if (s < 60) return s + ' сек';
+    const m = Math.floor(s / 60);
+    const rem = s % 60;
+    if (m < 60) return m + ' мин ' + rem + ' сек';
+    const h = Math.floor(m / 60);
+    return h + ' ч ' + (m % 60) + ' мин';
+}
+
+function formatLocalTime(iso) {
+    try {
+        const d = new Date(iso.endsWith('Z') ? iso : iso + 'Z');
+        return d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    } catch (_) {
+        return iso;
+    }
+}
+
+// Простые тосты вместо alert()
+function showToast(kind, title, body) {
+    const root = document.getElementById('toastContainer');
+    if (!root) {
+        // Fallback на случай отсутствия контейнера
+        console.log('[toast]', kind, title, body);
+        return;
+    }
+    const el = document.createElement('div');
+    el.className = 'toast toast-' + (kind || 'info');
+    el.innerHTML =
+        '<div class="toast-title"></div>' +
+        '<div class="toast-body"></div>' +
+        '<button class="toast-close" aria-label="Закрыть">×</button>';
+    el.querySelector('.toast-title').textContent = title || '';
+    el.querySelector('.toast-body').textContent = body || '';
+    el.querySelector('.toast-close').addEventListener('click', () => el.remove());
+    root.appendChild(el);
+    // Автоскрытие
+    const ttl = kind === 'error' ? 8000 : 4500;
+    setTimeout(() => { if (el.parentNode) el.remove(); }, ttl);
+}
+
+// Утилиты
 function truncateText(text, maxLength) {
     if (!text) return '';
     if (text.length <= maxLength) return text;
@@ -810,23 +1336,27 @@ function formatDate(dateStr) {
 // Модальное окно настроек
 async function openSettingsModal() {
     try {
-        // Загружаем список каналов
-        const channelsResponse = await fetch('/api/channels');
-        const channelsData = await channelsResponse.json();
-        
+        // Источник истины — реестр (таблица channels в БД). Textarea используется
+        // только для массового append-добавления и по умолчанию скрыта.
         const channelsTextarea = document.getElementById('channelsTextarea');
-        channelsTextarea.value = channelsData.channels.join('\n');
-        updateChannelsCount();
+        if (channelsTextarea) {
+            channelsTextarea.value = '';
+            updateChannelsCount();
+        }
+        const bulk = document.getElementById('bulkAddBlock');
+        if (bulk) bulk.style.display = 'none';
+
+        if (typeof window.loadChannelRegistry === 'function') {
+            window.loadChannelRegistry();
+        }
         
         // Загружаем настройки
         const settingsResponse = await fetch('/api/settings');
         const settingsData = await settingsResponse.json();
         
-        // Заполняем поля настроек
-        document.getElementById('apiKeyInput').value = settingsData.openai_api_key || '';
+        // Заполняем поля настроек.
+        // OpenAI API ключ берётся ТОЛЬКО из .env (OPENAI_API_KEY) — в UI его нет.
         document.getElementById('promptTextarea').value = settingsData.analysis_prompt || 'Что на этом фото?';
-        document.getElementById('telegramApiIdInput').value = settingsData.telegram_api_id || '';
-        document.getElementById('telegramApiHashInput').value = settingsData.telegram_api_hash || '';
         
         const modal = document.getElementById('settingsModal');
         modal.classList.add('open');
@@ -863,8 +1393,7 @@ function switchSettingsTab(tabName) {
     
     const panels = {
         'channels': 'settingsChannels',
-        'telegram': 'settingsTelegram',
-        'api': 'settingsAPI',
+        'filters': 'settingsFilters',
         'prompt': 'settingsPrompt',
         'scheduler': 'settingsScheduler'
     };
@@ -875,64 +1404,15 @@ function switchSettingsTab(tabName) {
     }
 }
 
-// Показать/скрыть API ключ
-function toggleApiKeyVisibility() {
-    const input = document.getElementById('apiKeyInput');
-    const btn = document.getElementById('btnToggleApiKey');
-    
-    if (input.type === 'password') {
-        input.type = 'text';
-        btn.textContent = '🙈 Скрыть';
-    } else {
-        input.type = 'password';
-        btn.textContent = '👁️ Показать';
-    }
-}
-
-// Показать/скрыть Telegram API Hash
-function toggleTgApiHashVisibility() {
-    const input = document.getElementById('telegramApiHashInput');
-    const btn = document.getElementById('btnToggleTgApiHash');
-    
-    if (input.type === 'password') {
-        input.type = 'text';
-        btn.textContent = '🙈 Скрыть';
-    } else {
-        input.type = 'password';
-        btn.textContent = '👁️ Показать';
-    }
-}
-
-// Сброс сессии Telegram
-async function resetTgSession() {
-    if (!confirm('Вы уверены? Сессия Telegram будет удалена. После этого потребуется повторная авторизация при запуске парсера.')) {
-        return;
-    }
-    
-    try {
-        const response = await fetch('/api/telegram/reset-session', { method: 'POST' });
-        const data = await response.json();
-        
-        if (response.ok) {
-            alert(data.message || 'Сессия Telegram успешно сброшена');
-        } else {
-            alert('Ошибка: ' + (data.detail || 'Не удалось сбросить сессию'));
-        }
-    } catch (error) {
-        console.error('Ошибка при сбросе сессии:', error);
-        alert('Ошибка при сбросе сессии Telegram');
-    }
-}
-
 async function saveSettings() {
     const btn = document.getElementById('btnSaveSettings');
     btn.disabled = true;
     btn.textContent = 'Сохранение...';
-    
+
     try {
         // Определяем активную вкладку
         const activeTab = document.querySelector('.settings-tab.active').dataset.tab;
-        
+
         // Если активна вкладка планировщика, сохраняем настройки планировщика
         if (activeTab === 'scheduler') {
             await saveScheduleSettings();
@@ -940,35 +1420,16 @@ async function saveSettings() {
             btn.textContent = 'Сохранить';
             return;
         }
-        
-        // Сохраняем каналы
-        const channelsText = document.getElementById('channelsTextarea').value.trim();
-        const channels = channelsText
-            .split('\n')
-            .map(ch => ch.trim())
-            .filter(ch => ch.length > 0);
-        
-        if (channels.length > 0) {
-            const channelsResponse = await fetch('/api/channels', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(channels)
-            });
-            
-            if (!channelsResponse.ok) {
-                const chErr = await channelsResponse.json().catch(() => ({}));
-                const chDetail = chErr.detail;
-                const chMsg = typeof chDetail === 'string' ? chDetail : (Array.isArray(chDetail) ? chDetail.map(e => e.msg || JSON.stringify(e)).join('; ') : JSON.stringify(chDetail));
-                throw new Error(chMsg || 'Ошибка сохранения каналов');
-            }
-        }
-        
-        // Сохраняем настройки
+
+        // Каналы редактируются прямо в реестре (✎ / 🗑 / переключатель «Активен»)
+        // и в блоке массового добавления — отдельная кнопка «Добавить в реестр».
+        // На общем «Сохранить» каналы уже не трогаем, чтобы случайно не удалить
+        // ничего, что пользователь не видел в textarea.
+
+        // Сохраняем настройки.
+        // OpenAI API ключ намеренно НЕ передаётся с фронтенда — он хранится только в .env.
         const settings = {
-            openai_api_key: document.getElementById('apiKeyInput').value.trim(),
-            analysis_prompt: document.getElementById('promptTextarea').value.trim(),
-            telegram_api_id: document.getElementById('telegramApiIdInput').value.trim(),
-            telegram_api_hash: document.getElementById('telegramApiHashInput').value.trim()
+            analysis_prompt: document.getElementById('promptTextarea').value.trim()
         };
         
         const settingsResponse = await fetch('/api/settings', {
@@ -984,9 +1445,7 @@ async function saveSettings() {
             closeSettingsModal();
             loadStats(); // Обновляем список каналов в сайдбаре
         } else {
-            const sDetail = settingsData.detail;
-            const sMsg = typeof sDetail === 'string' ? sDetail : (Array.isArray(sDetail) ? sDetail.map(e => e.msg || JSON.stringify(e)).join('; ') : JSON.stringify(sDetail));
-            alert(`Ошибка: ${sMsg || 'Не удалось сохранить настройки'}`);
+            alert(`Ошибка: ${settingsData.detail}`);
         }
         
     } catch (error) {
@@ -1000,15 +1459,108 @@ async function saveSettings() {
 
 function updateChannelsCount() {
     const textarea = document.getElementById('channelsTextarea');
+    if (!textarea) return;
     const channelsText = textarea.value.trim();
-    
+
     const channels = channelsText
         .split('\n')
-        .map(ch => ch.trim())
+        .map(ch => ch.trim().replace(/^@+/, ''))
         .filter(ch => ch.length > 0);
-    
+
     const countElement = document.getElementById('channelsCount');
-    countElement.textContent = channels.length;
+    if (countElement) countElement.textContent = channels.length;
+}
+
+// ===== Bulk-add / single-add для реестра каналов =====
+
+window.toggleBulkAdd = function (force) {
+    const block = document.getElementById('bulkAddBlock');
+    if (!block) return;
+    const show = (typeof force === 'boolean')
+        ? force
+        : (block.style.display === 'none');
+    block.style.display = show ? '' : 'none';
+    if (show) {
+        const ta = document.getElementById('channelsTextarea');
+        if (ta) { ta.value = ''; ta.focus(); }
+        updateChannelsCount();
+    }
+};
+
+window.addChannelPrompt = async function () {
+    const raw = prompt('Введите username канала (без @):', '');
+    if (raw === null) return;
+    const username = String(raw).trim().replace(/^@+/, '');
+    if (!username) return;
+    await _appendChannelsToRegistry([username]);
+};
+
+window.bulkAddChannels = async function () {
+    const ta = document.getElementById('channelsTextarea');
+    if (!ta) return;
+    const channels = ta.value
+        .split('\n')
+        .map(ch => ch.trim().replace(/^@+/, ''))
+        .filter(ch => ch.length > 0);
+    if (!channels.length) {
+        alert('Список пуст. Введите хотя бы один username.');
+        return;
+    }
+    const ok = await _appendChannelsToRegistry(channels);
+    if (ok) {
+        ta.value = '';
+        updateChannelsCount();
+        window.toggleBulkAdd(false);
+    }
+};
+
+/**
+ * Append-only добавление каналов в реестр.
+ *
+ * Чтобы не задеть «деактивацию ручных, отсутствующих в новом списке» в
+ * POST /api/channels, мы предварительно объединяем новые имена с уже
+ * существующими manual-каналами из реестра и шлём общий список.
+ */
+async function _appendChannelsToRegistry(newChannels) {
+    try {
+        const regRes = await fetch('/api/channels');
+        const regData = await regRes.json();
+        const existingManual = Array.isArray(regData.manual) ? regData.manual : [];
+        const seen = new Set(existingManual.map(c => c.toLowerCase()));
+        const merged = existingManual.slice();
+        let appended = 0;
+        for (const ch of newChannels) {
+            const key = ch.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            merged.push(ch);
+            appended += 1;
+        }
+        if (!appended) {
+            if (typeof showToast === 'function') {
+                showToast('info', 'Уже в реестре', 'Все указанные каналы уже добавлены.');
+            } else {
+                alert('Эти каналы уже есть в реестре.');
+            }
+            return true;
+        }
+        const res = await fetch('/api/channels', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(merged),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+        if (typeof showToast === 'function') {
+            showToast('info', '✓ Добавлено', `Каналов добавлено: ${appended}`);
+        }
+        window.loadChannelRegistry();
+        return true;
+    } catch (err) {
+        console.warn('append channels failed', err);
+        alert('Не удалось добавить каналы: ' + (err.message || err));
+        return false;
+    }
 }
 
 // ========== ТАБЛИЧНОЕ ПРЕДСТАВЛЕНИЕ ==========
@@ -1076,10 +1628,9 @@ function renderTableRows(creatives, append = false) {
             ? generatePromptDescription(creative)
             : 'Анализ не выполнен';
         
-        const resolvedImageUrl = resolveImageUrl(imagePath);
         row.innerHTML = `
             <td class="table-cell-image">
-                <img src="${resolvedImageUrl}" alt="${creative.channel}" 
+                <img src="/${imagePath}" alt="${creative.channel}" 
                      onerror="this.src='/static/placeholder.png'">
             </td>
             <td class="table-cell-channel">${creative.channel}</td>
@@ -1093,7 +1644,7 @@ function renderTableRows(creatives, append = false) {
                 <div class="table-text-content">${promptDescription}</div>
             </td>
             <td class="table-cell-actions">
-                <button class="btn-table-action" onclick="event.stopPropagation(); downloadImage('${resolvedImageUrl}', '${creative.channel}_${creative.id}')">
+                <button class="btn-table-action" onclick="event.stopPropagation(); downloadImage('/${imagePath}', '${creative.channel}_${creative.id}')">
                     💾 Скачать
                 </button>
                 <button class="btn-table-action" onclick="event.stopPropagation(); copyPromptDescription(\`${promptDescription.replace(/`/g, '\\`')}\`)">
@@ -1219,74 +1770,90 @@ function formatDateShort(dateStr) {
 // Применение фильтров
 function applyFilters() {
     // Читаем значения фильтров
-    const channel = document.getElementById('filterChannel').value;
-    const erMin = parseFloat(document.getElementById('filterERMin').value) || null;
-    const erMax = parseFloat(document.getElementById('filterERMax').value) || null;
-    const viewsMin = parseInt(document.getElementById('filterViewsMin').value) || null;
-    const viewsMax = parseInt(document.getElementById('filterViewsMax').value) || null;
-    
+    const channelSelect = document.getElementById('filterChannel');
+    const channels = channelSelect
+        ? Array.from(channelSelect.selectedOptions).map(o => o.value).filter(Boolean)
+        : [];
+    const erMinRaw = document.getElementById('filterERMin').value;
+    const erMaxRaw = document.getElementById('filterERMax').value;
+    const viewsMinRaw = document.getElementById('filterViewsMin').value;
+    const viewsMaxRaw = document.getElementById('filterViewsMax').value;
+    const daysRaw = document.getElementById('filterDays')?.value || '';
+    const relevantOnly = !!document.getElementById('filterRelevantOnly')?.checked;
+    const dedupe = !!document.getElementById('filterDedupe')?.checked;
+    const erMin = erMinRaw === '' ? null : parseFloat(erMinRaw);
+    const erMax = erMaxRaw === '' ? null : parseFloat(erMaxRaw);
+    const viewsMin = viewsMinRaw === '' ? null : parseInt(viewsMinRaw);
+    const viewsMax = viewsMaxRaw === '' ? null : parseInt(viewsMaxRaw);
+    const days = daysRaw === '' ? null : parseInt(daysRaw);
+
     // Сохраняем в state
-    state.filters = { channel, erMin, erMax, viewsMin, viewsMax };
-    
-    // Фильтруем данные
-    state.filteredData = state.tableData.filter(creative => {
-        // Фильтр по каналу
-        if (channel && creative.channel !== channel) {
-            return false;
-        }
-        
-        // Фильтр по ER
-        const er = creative.er || 0;
-        if (erMin !== null && er < erMin) {
-            return false;
-        }
-        if (erMax !== null && er > erMax) {
-            return false;
-        }
-        
-        // Фильтр по просмотрам
-        const views = creative.views || 0;
-        if (viewsMin !== null && views < viewsMin) {
-            return false;
-        }
-        if (viewsMax !== null && views > viewsMax) {
-            return false;
-        }
-        
-        return true;
-    });
-    
-    // Перерисовываем таблицу с отфильтрованными данными
-    renderTableRows(state.filteredData, false);
-    
-    // Скрываем кнопку "Загрузить еще" при активных фильтрах
-    document.getElementById('loadMoreTableContainer').style.display = 'none';
+    state.filters = {
+        channels,
+        erMin: Number.isNaN(erMin) ? null : erMin,
+        erMax: Number.isNaN(erMax) ? null : erMax,
+        viewsMin: Number.isNaN(viewsMin) ? null : viewsMin,
+        viewsMax: Number.isNaN(viewsMax) ? null : viewsMax,
+        days: Number.isNaN(days) ? null : days,
+        relevantOnly,
+        dedupe,
+    };
+
+    // 1) Галерея на главной — перезапрашиваем с учётом фильтра по каналу
+    //    и применяем клиентские фильтры (ER/просмотры).
+    state.offset = 0;
+    state.selectedChannel = null; // фильтр в баре имеет приоритет над сайдбаром
+    if (state.currentTab === 'gallery' || !state.currentTab) {
+        loadCreatives(false);
+    }
+
+    // 2) Таблица — применяем те же фильтры к уже загруженным данным
+    state.filteredData = applyClientFilters(state.tableData);
+    if (state.currentTab === 'table') {
+        renderTableRows(state.filteredData, false);
+        document.getElementById('loadMoreTableContainer').style.display = 'none';
+    }
 }
 
 // Сброс фильтров
 function resetFilters() {
     // Очищаем поля фильтров
-    document.getElementById('filterChannel').value = '';
+    const channelSelect = document.getElementById('filterChannel');
+    if (channelSelect) {
+        Array.from(channelSelect.options).forEach(o => { o.selected = false; });
+    }
     document.getElementById('filterERMin').value = '';
     document.getElementById('filterERMax').value = '';
     document.getElementById('filterViewsMin').value = '';
     document.getElementById('filterViewsMax').value = '';
-    
+    const daysEl = document.getElementById('filterDays');
+    if (daysEl) daysEl.value = '';
+    const relEl = document.getElementById('filterRelevantOnly');
+    if (relEl) relEl.checked = false;
+    const dedupEl = document.getElementById('filterDedupe');
+    if (dedupEl) dedupEl.checked = false;
+
     // Сбрасываем state
     state.filters = {
-        channel: '',
+        channels: [],
         erMin: null,
         erMax: null,
         viewsMin: null,
-        viewsMax: null
+        viewsMax: null,
+        days: null,
+        relevantOnly: false,
+        dedupe: false,
     };
     state.filteredData = [];
-    
-    // Показываем все данные
+
+    // Перезагружаем галерею без фильтров
+    state.offset = 0;
+    loadCreatives(false);
+
+    // Перерисовываем таблицу со всеми данными
     renderTableRows(state.tableData, false);
-    
-    // Показываем кнопку "Загрузить еще" если есть еще данные
-    document.getElementById('loadMoreTableContainer').style.display = state.tableHasMore ? 'block' : 'none';
+    const loadMoreEl = document.getElementById('loadMoreTableContainer');
+    if (loadMoreEl) loadMoreEl.style.display = state.tableHasMore ? 'block' : 'none';
 }
 
 // ========== ЛОГИ ==========
@@ -1417,3 +1984,673 @@ function filterLogs() {
         }
     });
 }
+
+
+// ===================================================================
+// Phase 2/3/6/7 — Channel filters, discovery, search
+// ===================================================================
+
+(function () {
+    'use strict';
+
+    const $ = (id) => document.getElementById(id);
+
+    async function fetchJSON(url, options) {
+        const resp = await fetch(url, options);
+        if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+        return resp.json();
+    }
+
+    // ---- Channel filters tab ----
+    async function loadChannelFilters() {
+        try {
+            const data = await fetchJSON('/api/channel-filters');
+            if ($('cfMinSubs')) $('cfMinSubs').value = data.min_subscribers ?? 5000;
+            if ($('cfMinEr')) $('cfMinEr').value = data.min_er ?? 2.0;
+            if ($('cfRequireReactions')) $('cfRequireReactions').checked = !!data.require_reactions;
+            if ($('cfMinPpw')) $('cfMinPpw').value = data.min_posts_per_week ?? 1.0;
+            if ($('cfKeywords')) $('cfKeywords').value = data.search_keywords || '';
+        } catch (e) {
+            console.warn('loadChannelFilters failed', e);
+        }
+    }
+
+    async function saveChannelFilters() {
+        const payload = {
+            min_subscribers: parseInt($('cfMinSubs').value || '0', 10),
+            min_er: parseFloat($('cfMinEr').value || '0'),
+            require_reactions: $('cfRequireReactions').checked,
+            min_posts_per_week: parseFloat($('cfMinPpw').value || '0'),
+            search_keywords: $('cfKeywords').value || '',
+        };
+        await fetchJSON('/api/channel-filters', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+    }
+
+    // ---- Channel discovery ----
+    let discoveryPollTimer = null;
+
+    function showDiscoveryProgress(show) {
+        const wrap = $('discoveryProgressWrap');
+        if (wrap) wrap.style.display = show ? 'block' : 'none';
+    }
+
+    function renderDiscoveryProgress(s) {
+        const total = s.total_keywords || 0;
+        const done = s.processed_keywords || 0;
+        const percent = s.percent || 0;
+        const label = $('discoveryProgressLabel');
+        const pct = $('discoveryProgressPercent');
+        const bar = $('discoveryProgressBar');
+        const checked = $('discoveryCheckedCount');
+        const accepted = $('discoveryAcceptedCount');
+        const events = $('discoveryEvents');
+        if (label) label.textContent = `${done} / ${total} ключевых слов` +
+            (s.current_keyword ? ` · «${s.current_keyword}»` : '');
+        if (pct) pct.textContent = `${percent}%`;
+        if (bar) bar.style.width = `${percent}%`;
+        if (checked) checked.textContent = s.checked_channels || 0;
+        if (accepted) accepted.textContent = s.accepted_channels || 0;
+        if (events && Array.isArray(s.events)) {
+            const wasAtBottom = Math.abs(events.scrollHeight - events.clientHeight - events.scrollTop) < 20;
+            events.innerHTML = s.events.map(line => {
+                const safe = line.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const cls = line.startsWith('✅') ? 'color:#0a0' :
+                            line.startsWith('✕') ? 'color:#a00' : '';
+                return `<div style="${cls}">${safe}</div>`;
+            }).join('');
+            if (wasAtBottom) events.scrollTop = events.scrollHeight;
+        }
+    }
+
+    async function startDiscovery() {
+        const status = $('discoveryStatus');
+        const results = $('discoveryResults');
+        if (status) status.textContent = 'Сохранение настроек…';
+        try {
+            await saveChannelFilters();
+            await fetchJSON('/api/channels/discover', { method: 'POST' });
+            if (status) status.textContent = 'Поиск запущен…';
+            if (results) results.textContent = '';
+            showDiscoveryProgress(true);
+            renderDiscoveryProgress({
+                total_keywords: 0, processed_keywords: 0, percent: 0,
+                checked_channels: 0, accepted_channels: 0, events: [],
+            });
+            pollDiscovery();
+        } catch (e) {
+            if (status) status.textContent = `Ошибка: ${e.message}`;
+        }
+    }
+
+    async function pollDiscovery() {
+        clearInterval(discoveryPollTimer);
+        discoveryPollTimer = setInterval(async () => {
+            try {
+                const s = await fetchJSON('/api/channels/discover/status');
+                $('discoveryStatus').textContent = s.message || '';
+                renderDiscoveryProgress(s);
+                if (!s.running) {
+                    clearInterval(discoveryPollTimer);
+                    const out = (s.results || []).map(r =>
+                        `@${r.username} — ${r.subscribers} подп., ER ${r.avg_er}%, ${r.posts_per_week}/нед`
+                    );
+                    $('discoveryResults').innerHTML = out.length
+                        ? '<b>Найдено:</b><br>' + out.join('<br>')
+                        : '<i>Каналы не найдены под текущие критерии.</i>';
+                }
+            } catch (e) {
+                clearInterval(discoveryPollTimer);
+                $('discoveryStatus').textContent = `Ошибка опроса: ${e.message}`;
+            }
+        }, 1500);
+    }
+
+    // ---- Search bar bound to existing filters bar ----
+    function attachSearchBindings() {
+        const search = $('filterSearch');
+        const tag = $('filterTag');
+        const moderation = $('filterModeration');
+        const channel = $('filterChannel');
+        const days = $('filterDays');
+        const relevantOnly = $('filterRelevantOnly');
+        const dedupe = $('filterDedupe');
+        if (!search) return;
+        const apply = () => {
+            if (typeof window.applyFilters === 'function') {
+                window.applyFilters();
+            } else {
+                runSearchIntoGrid();
+            }
+        };
+        let debounceTimer;
+        search.addEventListener('input', () => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(apply, 350);
+        });
+        if (tag) tag.addEventListener('change', apply);
+        if (moderation) moderation.addEventListener('change', apply);
+        if (channel) channel.addEventListener('change', apply);
+        if (days) days.addEventListener('change', apply);
+        if (relevantOnly) relevantOnly.addEventListener('change', apply);
+        if (dedupe) dedupe.addEventListener('change', apply);
+    }
+
+    async function runSearchIntoGrid() {
+        const params = new URLSearchParams();
+        const q = $('filterSearch')?.value?.trim();
+        const tagEl = $('filterTag');
+        const tagList = tagEl
+            ? Array.from(tagEl.selectedOptions).map(o => o.value).filter(Boolean)
+            : [];
+        const moderation = $('filterModeration')?.value;
+        const channelEl = $('filterChannel');
+        const channels = channelEl
+            ? Array.from(channelEl.selectedOptions).map(o => o.value).filter(Boolean)
+            : [];
+        const erMin = $('filterERMin')?.value;
+        const days = $('filterDays')?.value;
+        const relevantOnly = $('filterRelevantOnly')?.checked;
+        const dedupe = $('filterDedupe')?.checked;
+        if (q) params.set('q', q);
+        if (tagList.length) params.set('tags', tagList.join(','));
+        if (moderation) params.set('moderation', moderation);
+        if (channels.length) params.set('channel', channels.join(','));
+        if (erMin) params.set('er_min', erMin);
+        if (days) params.set('days', days);
+        if (relevantOnly) params.set('relevant_only', 'true');
+        if (dedupe) params.set('dedupe', 'true');
+        params.set('limit', '50');
+        try {
+            const data = await fetchJSON(`/api/search?${params.toString()}`);
+            const grid = $('creativesGrid');
+            if (!grid) return;
+            if (typeof window.renderCreatives === 'function') {
+                window.renderCreatives(data.creatives || []);
+                return;
+            }
+            grid.innerHTML = (data.creatives || []).map(c => {
+                const img = c.image && c.image.file_path ? c.image.file_path : '/static/placeholder.png';
+                const tags = (c.analysis && c.analysis.tags) ? c.analysis.tags.join(', ') : '';
+                return `<div class="creative-card">
+                    <img src="${img}" alt="" loading="lazy">
+                    <div class="creative-meta">
+                        <div><b>${c.channel}</b> · ER ${c.er}% · 👁 ${c.views}</div>
+                        <div>${tags}</div>
+                    </div>
+                </div>`;
+            }).join('') || '<div class="loading">Ничего не найдено</div>';
+        } catch (e) {
+            console.warn('Search failed', e);
+        }
+    }
+
+    // ---- Wire up after DOM is ready ----
+    function init() {
+        const btn = $('btnDiscoverChannels');
+        if (btn) btn.addEventListener('click', startDiscovery);
+
+        // Load filter settings + reattach to running discovery whenever the tab becomes visible
+        const settingsTab = document.querySelector('.settings-tab[data-tab="filters"]');
+        if (settingsTab) settingsTab.addEventListener('click', () => {
+            loadChannelFilters();
+            // If discovery already running on the server — re-attach polling and show progress
+            fetchJSON('/api/channels/discover/status').then(s => {
+                if (s.running) {
+                    showDiscoveryProgress(true);
+                    renderDiscoveryProgress(s);
+                    pollDiscovery();
+                } else if ((s.events && s.events.length) || (s.results && s.results.length)) {
+                    // Show last completed run results
+                    showDiscoveryProgress(true);
+                    renderDiscoveryProgress(s);
+                }
+            }).catch(() => {});
+        });
+
+        // Auto-save on blur
+        ['cfMinSubs', 'cfMinEr', 'cfRequireReactions', 'cfMinPpw', 'cfKeywords']
+            .forEach(id => {
+                const el = $(id);
+                if (el) el.addEventListener('change', () => {
+                    saveChannelFilters().catch(err => console.warn(err));
+                });
+            });
+
+        attachSearchBindings();
+        // Pre-load once so values are populated when tab is opened
+        loadChannelFilters();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();
+
+/* ---------------------------------------------------------------------------
+ * Phase 3-7 frontend extensions:
+ *   - Tags / target description / moderation in detail panel
+ *   - Cross-channel citations
+ *   - Channel registry
+ *   - Extended stats
+ * Exposed as window.* to be callable from inline onclick handlers.
+ * ------------------------------------------------------------------------- */
+
+window.escapeHtml = function (text) {
+    if (text == null) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+};
+
+window.moderationLabel = function (status) {
+    switch (status) {
+        case 'approved': return '✓ Одобрено';
+        case 'rejected': return '✕ Отклонено';
+        case 'auto_approved': return '🤖 Авто-одобрено';
+        case 'auto_rejected': return '🤖 Авто-отклонено';
+        default: return '⏳ Ожидает';
+    }
+};
+
+window.loadCitations = async function (creativeId) {
+    const block = document.getElementById('citationsBlock');
+    if (!block) return;
+    try {
+        const res = await fetch(`/api/creative/${creativeId}/citations`);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const list = data.citations || [];
+        if (!list.length) {
+            block.innerHTML = '<div class="muted">Цитирования не найдены</div>';
+            return;
+        }
+        block.innerHTML = list.map(c => {
+            const sim = c.similarity_score != null
+                ? `${(c.similarity_score * 100).toFixed(0)}%`
+                : '?';
+            return `
+                <div class="citation-item">
+                    <div class="citation-header">
+                        <strong>${window.escapeHtml(c.channel || '?')}</strong>
+                        <span class="muted">· Похожесть ${sim}</span>
+                    </div>
+                    ${c.post_url ? `
+                        <a href="${c.post_url}" target="_blank" rel="noopener" class="detail-link">
+                            Открыть пост в Telegram →
+                        </a>
+                    ` : ''}
+                    <div class="muted" style="font-size:12px">
+                        ${c.detected_at ? new Date(c.detected_at).toLocaleString('ru-RU') : ''}
+                    </div>
+                </div>
+            `;
+        }).join('');
+    } catch (err) {
+        console.warn('citations load failed', err);
+        block.innerHTML = '<div class="muted">Не удалось загрузить</div>';
+    }
+};
+
+window.generateTargetDescription = async function (creativeId) {
+    const block = document.getElementById('targetDescriptionBlock');
+    if (!block) return;
+    const original = block.innerHTML;
+    block.innerHTML = '<div class="loading">Генерация…</div>';
+    try {
+        const res = await fetch(`/api/creative/${creativeId}/generate-description`, { method: 'POST' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const text = data.description || data.target_description || data.target_creative_description;
+        if (text) {
+            block.textContent = text;
+        } else {
+            block.innerHTML = '<span class="muted">Пустой ответ от модели</span>';
+        }
+    } catch (err) {
+        console.warn('target description generation failed', err);
+        block.innerHTML = original;
+        alert('Не удалось сгенерировать описание: ' + err.message);
+    }
+};
+
+window.copyTargetDescription = async function (creativeId) {
+    const block = document.getElementById('targetDescriptionBlock');
+    if (!block) return;
+    const text = block.innerText.trim();
+    if (!text) return;
+    try {
+        await navigator.clipboard.writeText(text);
+        const orig = block.innerHTML;
+        block.innerHTML = '<span class="muted">✓ Скопировано в буфер обмена</span>';
+        setTimeout(() => { block.innerHTML = orig; }, 1200);
+    } catch (e) {
+        console.warn('clipboard failed', e);
+        alert('Не удалось скопировать. Скопируйте вручную.');
+    }
+};
+
+window.moderateCreative = async function (creativeId, status) {
+    try {
+        let reason = null;
+        if (status === 'rejected') {
+            reason = prompt('Причина отклонения (необязательно):') || null;
+        }
+        const res = await fetch(`/api/creative/${creativeId}/moderate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status, reason })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        // Reload the detail panel to reflect the new status
+        if (typeof window.openCreativeDetail === 'function') {
+            await window.openCreativeDetail(creativeId);
+        }
+        // Refresh card list silently
+        if (typeof window.loadCreatives === 'function') {
+            window.loadCreatives({ silent: true });
+        }
+    } catch (err) {
+        console.warn('moderation failed', err);
+        alert('Не удалось сохранить статус модерации: ' + err.message);
+    }
+};
+
+window.reanalyzeCreative = async function (creativeId) {
+    if (!window.confirm('Перезапустить классификацию и анализ для этого креатива?\nБудут использованы свежие промпты.')) return;
+    try {
+        if (typeof showToast === 'function') {
+            showToast('info', '🔄 Переанализ', 'Запущен повторный анализ…');
+        }
+        const res = await fetch(`/api/creative/${creativeId}/reanalyze`, { method: 'POST' });
+        let data = {};
+        try { data = await res.json(); } catch (_) { /* ignore */ }
+        if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+        if (typeof showToast === 'function') {
+            showToast('info', '✓ Готово', data.rejected_by_filter
+                ? `Отклонено фильтром: ${data.rejection_reason || '—'}`
+                : 'Классификация и анализ обновлены');
+        }
+        if (typeof window.openCreativeDetail === 'function') {
+            await window.openCreativeDetail(creativeId);
+        }
+        if (typeof window.loadCreatives === 'function') {
+            window.loadCreatives({ silent: true });
+        }
+    } catch (err) {
+        console.warn('reanalyze failed', err);
+        alert('Не удалось переанализировать: ' + (err.message || err));
+    }
+};
+
+/* ---------------------------------------------------------------------------
+ * Channel registry — discovered/active channels list inside Settings modal.
+ * ------------------------------------------------------------------------- */
+
+window.loadChannelRegistry = async function () {
+    const container = document.getElementById('channelRegistryList');
+    if (!container) return;
+    container.innerHTML = '<div class="loading">Загрузка…</div>';
+    try {
+        const res = await fetch('/api/channels/registry?limit=200');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const items = Array.isArray(data) ? data : (data.channels || []);
+        if (!items.length) {
+            container.innerHTML = `
+                <div class="muted">
+                    Реестр пуст. Запустите автопоиск во вкладке «Фильтры каналов»
+                    или добавьте каналы вручную во вкладке «Каналы».
+                </div>`;
+            return;
+        }
+        container.innerHTML = `
+            <table class="registry-table">
+                <thead>
+                    <tr>
+                        <th>Канал</th>
+                        <th>Подписчики</th>
+                        <th>ER</th>
+                        <th>Реакции</th>
+                        <th>Постов/нед</th>
+                        <th>Активен</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${items.map(ch => {
+                        const subs = ch.subscribers_count ?? ch.subscribers ?? 0;
+                        const er = ch.avg_er ?? 0;
+                        const hasReactions = ch.reactions_enabled ?? ch.has_reactions ?? false;
+                        const ppw = ch.posts_per_week ?? 0;
+                        const active = ch.is_active ?? ch.active ?? false;
+                        const sourceLabel = (ch.discovered_via === 'manual' || ch.discovered_via === null)
+                            ? '<span class="tag" title="Добавлен вручную">✋ ручной</span>'
+                            : '<span class="tag" title="Найден авто-поиском">🔎 авто</span>';
+                        // Эвристика «не нашли»: канал есть в реестре, но реальных метрик нет.
+                        const looksUnreachable = (Number(subs) === 0) && (Number(er) === 0)
+                            && !ch.last_parsed_at && !(ch.posts_collected || 0);
+                        const warnBadge = looksUnreachable
+                            ? '<span class="tag" title="Канал не удалось найти/обогатить — проверьте алиас, замените или удалите" style="background:#5a2a2a;color:#fbbcbc;">⚠ не найден</span>'
+                            : '';
+                        return `
+                        <tr data-id="${ch.id}" data-username="${window.escapeHtml(ch.username || '')}">
+                            <td>
+                                <strong>${window.escapeHtml(ch.title || ch.username)}</strong>
+                                ${ch.username ? `<div class="muted" style="font-size:12px">@${window.escapeHtml(ch.username)} · ${sourceLabel} ${warnBadge}</div>` : ''}
+                            </td>
+                            <td>${Number(subs).toLocaleString('ru-RU')}</td>
+                            <td>${Number(er).toFixed(1)}%</td>
+                            <td>${hasReactions ? '✓' : '—'}</td>
+                            <td>${ppw}</td>
+                            <td>
+                                <label class="switch">
+                                    <input type="checkbox" ${active ? 'checked' : ''}
+                                           onchange="window.toggleChannel(${ch.id})">
+                                    <span class="slider"></span>
+                                </label>
+                            </td>
+                            <td style="white-space:nowrap;">
+                                <button class="btn btn-secondary btn-sm" type="button"
+                                        title="Заменить алиас канала"
+                                        onclick="window.renameChannel(${ch.id}, '${window.escapeHtml(ch.username || '')}')">
+                                    ✎
+                                </button>
+                                <button class="btn btn-danger btn-sm" type="button"
+                                        title="Удалить канал из реестра"
+                                        onclick="window.deleteChannel(${ch.id}, '${window.escapeHtml(ch.username || '')}')">
+                                    🗑
+                                </button>
+                            </td>
+                        </tr>`;
+                    }).join('')}
+                </tbody>
+            </table>
+        `;
+    } catch (err) {
+        console.warn('registry load failed', err);
+        container.innerHTML = '<div class="muted">Ошибка загрузки реестра</div>';
+    }
+};
+
+window.toggleChannel = async function (channelId) {
+    try {
+        const res = await fetch(`/api/channels/registry/${channelId}/toggle`, { method: 'POST' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+    } catch (err) {
+        console.warn('toggle failed', err);
+        alert('Не удалось переключить канал');
+        window.loadChannelRegistry();
+    }
+};
+
+window.deleteChannel = async function (channelId, username) {
+    const label = username ? `@${username}` : `#${channelId}`;
+    if (!confirm(`Удалить канал ${label} из реестра?\n\nУже скачанные посты останутся в БД, но канал исчезнет из списков парсинга.`)) {
+        return;
+    }
+    try {
+        const res = await fetch(`/api/channels/registry/${channelId}`, { method: 'DELETE' });
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.detail || ('HTTP ' + res.status));
+        }
+        if (typeof showToast === 'function') {
+            showToast('info', '✓ Удалено', `Канал ${label} удалён из реестра`);
+        }
+        window.loadChannelRegistry();
+    } catch (err) {
+        console.warn('delete channel failed', err);
+        alert('Не удалось удалить канал: ' + (err.message || err));
+    }
+};
+
+window.renameChannel = async function (channelId, currentUsername) {
+    const newUsername = prompt(
+        `Введите новый username канала (без @).\n\nОставьте поле пустым и нажмите OK, чтобы отменить.\n\nТекущее значение: @${currentUsername || ''}`,
+        currentUsername || ''
+    );
+    if (newUsername === null) return;
+    const cleaned = String(newUsername).trim().replace(/^@+/, '');
+    if (!cleaned) {
+        alert('Имя канала не может быть пустым. Используйте кнопку «🗑», чтобы удалить запись.');
+        return;
+    }
+    if (cleaned.toLowerCase() === (currentUsername || '').toLowerCase()) {
+        return;
+    }
+    try {
+        const res = await fetch(`/api/channels/registry/${channelId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: cleaned, title: cleaned }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+        if (typeof showToast === 'function') {
+            showToast('info', '✓ Готово',
+                `Канал переименован: @${currentUsername} → @${cleaned}. ` +
+                'Запустите «Подтянуть статистику», чтобы пересчитать метрики.');
+        }
+        window.loadChannelRegistry();
+    } catch (err) {
+        console.warn('rename channel failed', err);
+        alert('Не удалось переименовать канал: ' + (err.message || err));
+    }
+};
+
+/* ---------------------------------------------------------------------------
+ * Подтянуть метрики (подписчики/ER/просмотры/постов в неделю) для каналов,
+ * у которых статистики нет — дергаем Telethon на бэке.
+ * ------------------------------------------------------------------------- */
+window.enrichChannels = async function (usernames) {
+    const btn = document.getElementById('btnEnrichChannels');
+    const label = document.getElementById('enrichStatusLabel');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Запуск…'; }
+    try {
+        const body = Array.isArray(usernames) && usernames.length
+            ? { usernames }
+            : {};
+        const res = await fetch('/api/channels/enrich', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (data.status === 'noop') {
+            if (label) label.textContent = 'Все каналы уже с метриками';
+            if (btn) { btn.disabled = false; btn.textContent = '📊 Подтянуть статистику'; }
+            return;
+        }
+        if (data.status === 'already_running') {
+            if (label) label.textContent = 'Уже выполняется…';
+        }
+        // Поллинг статуса
+        const poll = async () => {
+            try {
+                const r = await fetch('/api/channels/enrich/status');
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const s = await r.json();
+                if (label) {
+                    if (s.running) {
+                        const cur = s.current ? ` · @${s.current}` : '';
+                        label.textContent = `⏳ ${s.done}/${s.total} (✓${s.ok || 0} / ✕${s.failed || 0})${cur}`;
+                    } else {
+                        label.textContent = s.message || 'Готово';
+                    }
+                }
+                if (s.running) {
+                    setTimeout(poll, 1500);
+                } else {
+                    if (btn) { btn.disabled = false; btn.textContent = '📊 Подтянуть статистику'; }
+                    // Если были ошибки — покажем их в alert + консоль, чтобы было видно,
+                    // почему не для всех каналов подтянулась статистика.
+                    if (Array.isArray(s.errors) && s.errors.length) {
+                        const lines = s.errors.slice(0, 20).map(e =>
+                            (e && typeof e === 'object')
+                                ? `@${e.username}: ${e.reason}`
+                                : String(e)
+                        );
+                        console.warn('enrich errors:', s.errors);
+                        const more = s.errors.length > 20 ? `\n…и ещё ${s.errors.length - 20}` : '';
+                        alert(
+                            `Не подтянулась статистика для ${s.errors.length} канал(ов):\n\n` +
+                            lines.join('\n') + more
+                        );
+                    }
+                    window.loadChannelRegistry();
+                }
+            } catch (e) {
+                console.warn('enrich poll failed', e);
+                if (btn) { btn.disabled = false; btn.textContent = '📊 Подтянуть статистику'; }
+            }
+        };
+        setTimeout(poll, 800);
+    } catch (err) {
+        console.warn('enrich failed', err);
+        if (label) label.textContent = 'Ошибка запуска обогащения';
+        if (btn) { btn.disabled = false; btn.textContent = '📊 Подтянуть статистику'; }
+    }
+};
+
+/* ---------------------------------------------------------------------------
+ * Extended stats — populates the stats badge row + side panel if present.
+ * ------------------------------------------------------------------------- */
+
+window.loadExtendedStats = async function () {
+    try {
+        const res = await fetch('/api/stats/extended');
+        if (!res.ok) return;
+        const data = await res.json();
+        const set = (id, val) => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = val;
+        };
+        set('statApproved', data.approved ?? 0);
+        set('statRejected', data.rejected ?? 0);
+        set('statPending',  data.pending  ?? 0);
+        set('statCitations', data.total_citations ?? 0);
+        set('statChannelsActive', data.active_channels ?? 0);
+    } catch (err) {
+        console.warn('extended stats failed', err);
+    }
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+    // Auto-load registry when its tab is clicked
+    const regTab = document.querySelector('.settings-tab[data-tab="registry"]');
+    if (regTab) regTab.addEventListener('click', window.loadChannelRegistry);
+
+    // Periodically refresh extended stats (60s)
+    window.loadExtendedStats();
+    setInterval(window.loadExtendedStats, 60000);
+});

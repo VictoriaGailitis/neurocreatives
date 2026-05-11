@@ -7,6 +7,7 @@ __pycache__/
 venv/
 env/
 ENV/
+.venv/
 *.egg-info/
 dist/
 build/
@@ -14,12 +15,14 @@ build/
 # Database
 *.db
 *.sqlite
+*.sqlite3
 *.session
+*.session-journal
 
-# Environment
+# Environment — ВСЕ варианты .env под запретом (кроме шаблона)
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
 
 # IDE
 .vscode/
@@ -27,16 +30,25 @@ build/
 *.swp
 *.swo
 
-# Downloads
+# Downloads (медиа из Telegram)
 downloads/*
 !downloads/.gitkeep
 
-# Credentials
+# Sessions (Telethon)
+sessions/*
+!sessions/.gitkeep
+
+# Credentials & keys
 credentials.json
 parser_session.session
+*.pem
+*.key
+id_rsa*
+secrets/
 
 # Logs
 *.log
+logs/
 
 # OS
 .DS_Store
@@ -44,6 +56,8 @@ Thumbs.db
 
 # Archives
 *.zip
+*.tar
+*.tar.gz
 
 # Docker
 docker-compose.override.yml
@@ -52,11 +66,3 @@ docker-compose.override.yml
 *.backup
 *.bak
 backups/
-*.tar.gz
-
-# Temp files
-app_js_patch_final.txt
-screenshot_scheduler.png
-SELECT id,.sql
-check_images.py
-clean_posts_without_images.py

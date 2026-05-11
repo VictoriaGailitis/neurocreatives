@@ -1,67 +1,41 @@
-# === Git ===
-.git/
-.github/
+# Local artifacts not needed inside the image
+.git
+.gitignore
+.github
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
 
-# === Python cache ===
-__pycache__/
-*.py[cod]
-*$py.class
-venv/
-env/
-ENV/
-*.egg-info/
-.mypy_cache/
-.pytest_cache/
-
-# === Database sessions / local DBs ===
-*.session
-*.db
-*.sqlite
-
-# === Environment files (secrets — передаются через --env-file) ===
+# Secrets MUST never leak into the image
 .env
 .env.*
+!.env.example
+*.session
+*.session-journal
+credentials.json
+sessions/*.session
+*.pem
+*.key
+id_rsa*
+secrets/
 
-# === IDE ===
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# === Downloads (монтируется как volume) ===
+# Local data
 downloads/*
 !downloads/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
 
-# === Documentation ===
+# Docs / dev only
 *.md
-*.sql
-
-# === Backup / Archives ===
+!README.md
+.vscode
+.idea
 backups/
-*.zip
-*.tar.gz
-*.backup
-*.bak
-
-# === Screenshots / large images in root ===
-screenshot_scheduler.png
-
-# === OS ===
-.DS_Store
-Thumbs.db
-
-# === Docker configs (не нужны внутри образа) ===
-Dockerfile
-Dockerfile.*
-docker-compose*.yml
-
-# === Deploy scripts ===
-deploy/
-
-# === Logs ===
+logs/
 *.log
-
-# === Utility scripts ===
-check_images.py
-clean_posts_without_images.py
-app_js_patch_final.txt

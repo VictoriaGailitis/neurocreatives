@@ -5,28 +5,40 @@ from dotenv import load_dotenv
 # Загружаем переменные окружения из .env файла
 load_dotenv()
 
+
+def _require(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"Environment variable {name} is required. "
+            f"Set it in .env (see .env.example) or in the host environment."
+        )
+    return value
+
+
 # --- Настройки для Telegram ---
 # Получи свои api_id и api_hash на my.telegram.org
-TELEGRAM_API_ID = int(os.getenv('TELEGRAM_API_ID', '24628377'))
-TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH', '2a52966d6223c3068e23d45e88c7a95a')
+TELEGRAM_API_ID = int(_require('TELEGRAM_API_ID'))
+TELEGRAM_API_HASH = _require('TELEGRAM_API_HASH')
 
 # Список Telegram каналов для парсинга
 # Важно: твой аккаунт должен быть подписан на эти каналы
-CHANNELS_TO_PARSE = os.getenv('CHANNELS_TO_PARSE', 'GuerrillaMarketing,Durov,sostav').split(',')
+CHANNELS_TO_PARSE = [
+    c.strip() for c in os.getenv('CHANNELS_TO_PARSE', '').split(',') if c.strip()
+]
 
 # --- Настройки для OpenAI ---
-# Получи API ключ на platform.openai.com
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', 'your-openai-api-key-here')
+# Получи API ключ на platform.openai.com (можно оставить пустым и задать через UI Settings)
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
 
 # --- Настройки базы данных ---
-# PostgreSQL connection string (Yandex Cloud)
-DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://user1:XXXXXXXXXXX@rc1b-rekalc1eaddo7kol.mdb.yandexcloud.net:6432/db_neurocreatives?sslmode=verify-full&target_session_attrs=read-write')
+# PostgreSQL connection string. Локально через docker compose дефолт ниже,
+# в продакшене обязательно переопределяй через DATABASE_URL в .env.
+DATABASE_URL = os.getenv(
+    'DATABASE_URL',
+    'postgresql://neurocreatives:neurocreatives@db:5432/neurocreatives',
+)
 
 # --- Настройки сервера ---
 HOST = os.getenv('HOST', '0.0.0.0')
 PORT = int(os.getenv('PORT', '8000'))
-
-# --- Удалённый сервер с картинками ---
-# Если задан, локально отсутствующие картинки будут загружаться с этого URL
-# Пример: https://your-server.example.com  (без trailing slash)
-REMOTE_IMAGES_BASE_URL = os.getenv('REMOTE_IMAGES_BASE_URL', 'https://neurocreatives.maksimprojects.space')

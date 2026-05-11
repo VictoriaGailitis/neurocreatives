@@ -1,21 +1,141 @@
+import json
+import logging
 import os
-import asyncio
 from datetime import date, datetime, timedelta
+from urllib.parse import urlparse
+
 from telethon.sync import TelegramClient
+from telethon.sessions import StringSession
+from telethon import connection as tl_connection
 from sqlalchemy.orm import Session
 
-from db.models import Post, Image
+from ai.image_similarity import compute_phash, record_citations
 from db.database import get_database
+from db.models import Image, Post
+
+logger = logging.getLogger(__name__)
+
+
+def _build_proxy() -> tuple[object | None, dict | None]:
+    """Read proxy settings from env. Returns (connection_class, proxy).
+
+    Supported envs (any one of these — the first non-empty wins):
+      • TELEGRAM_PROXY=socks5://user:pass@host:port
+      • TELEGRAM_PROXY=socks5://host:port             (no auth)
+      • TELEGRAM_PROXY=mtproxy://host:port:secret_hex
+      • TELEGRAM_PROXY=tg://proxy?secret=...&server=host&port=port  (MTProxy link from Telegram)
+      • plus generic HTTPS_PROXY / HTTP_PROXY (treated as http proxy).
+
+    No default — proxy must be set via env if needed.
+    """
+    raw = (
+        os.environ.get("TELEGRAM_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+    )
+    if not raw:
+        return None, None
+
+    from urllib.parse import parse_qs
+
+    parsed = urlparse(raw)
+    scheme = (parsed.scheme or "").lower()
+
+    # Handle tg://proxy?secret=... format (MTProxy link from Telegram)
+    if scheme == "tg" and parsed.netloc == "proxy":
+        query = parse_qs(parsed.query)
+        secret = query.get("secret", [None])[0]
+        if not secret:
+            logger.warning("MTProxy link without secret: %r", raw)
+            return None, None
+        host = query.get("server", [None])[0]
+        port = query.get("port", [None])[0]
+        if not host or not port:
+            logger.warning("MTProxy link without server/port: %r", raw)
+            return None, None
+        try:
+            port = int(port)
+        except ValueError:
+            logger.warning("Invalid port in MTProxy link: %r", port)
+            return None, None
+        logger.info("Using MTProxy: %s:%s", host, port)
+        return tl_connection.ConnectionTcpMTProxyRandomizedIntermediate, (host, port, secret)
+
+    host = parsed.hostname
+    port = parsed.port
+    if not host or not port:
+        logger.warning("Could not parse TELEGRAM_PROXY=%r, ignoring", raw)
+        return None, None
+
+    if scheme in ("socks5", "socks4", "http"):
+        try:
+            import socks  # PySocks
+        except ImportError:
+            logger.warning("PySocks required for SOCKS proxy: pip install pysocks")
+            return None, None
+        proxy_types = {
+            "socks5": socks.SOCKS5,
+            "socks4": socks.SOCKS4,
+            "http": socks.HTTP,
+        }
+        proxy_tuple = (
+            proxy_types[scheme],
+            host,
+            port,
+            True,  # rdns — resolve DNS through proxy
+            parsed.username or None,
+            parsed.password or None,
+        )
+        logger.info("Using %s proxy: %s:%s", scheme.upper(), host, port)
+        return None, proxy_tuple
+
+    if scheme == "mtproxy":
+        secret = parsed.path.lstrip("/") or parsed.password
+        if not secret:
+            logger.warning("MTProxy without secret: %r", raw)
+            return None, None
+        logger.info("Using MTProxy: %s:%s", host, port)
+        return tl_connection.ConnectionTcpMTProxyRandomizedIntermediate, (host, port, secret)
+
+    logger.warning("Unknown proxy scheme: %r, ignoring", scheme)
+    return None, None
 
 
 class TelegramParser:
     """Парсер для сбора постов из Telegram каналов."""
     
-    def __init__(self, api_id: int, api_hash: str, session_name: str = 'parser_session'):
+    def __init__(self, api_id: int, api_hash: str, session_name: str = None):
         self.api_id = api_id
         self.api_hash = api_hash
-        self.session_name = session_name
+        import os as _os
+
+        # 1) Highest priority — StringSession from env (great for Docker / CI).
+        session_string = _os.environ.get('TELEGRAM_SESSION_STRING')
+        if session_string:
+            self.session = StringSession(session_string)
+            self.session_name = '<StringSession>'
+        else:
+            # 2) Fallback — .session file on disk.
+            # Allow override via env (useful in Docker where /app/sessions is a volume).
+            # Fallback to ./sessions/parser_session if the directory exists, otherwise legacy ./parser_session.
+            if session_name is None:
+                session_name = _os.environ.get('TELEGRAM_SESSION_NAME')
+            if session_name is None:
+                sessions_dir = _os.path.join(_os.getcwd(), 'sessions')
+                if _os.path.isdir(sessions_dir):
+                    session_name = _os.path.join('sessions', 'parser_session')
+                else:
+                    session_name = 'parser_session'
+            # Make sure parent directory exists.
+            parent = _os.path.dirname(session_name)
+            if parent:
+                _os.makedirs(parent, exist_ok=True)
+            self.session = session_name
+            self.session_name = session_name
         self.downloads_folder = 'downloads'
+
+        # Build proxy configuration from env
+        self.connection_cls, self.proxy = _build_proxy()
     
     async def parse_channels(self, channels: list, limit: int = 100, parse_depth: str = 'today', parse_from_date: str = None):
         """
@@ -32,7 +152,13 @@ class TelegramParser:
         """
         print("🔌 Подключение к Telegram...")
         
-        async with TelegramClient(self.session_name, self.api_id, self.api_hash) as client:
+        client_kwargs = {"connection_retries": 3, "timeout": 30}
+        if self.connection_cls is not None:
+            client_kwargs["connection"] = self.connection_cls
+        if self.proxy is not None:
+            client_kwargs["proxy"] = self.proxy
+
+        async with TelegramClient(self.session, self.api_id, self.api_hash, **client_kwargs) as client:
             print("✓ Подключение успешно")
             
             # Создаем папку для загрузок
@@ -67,8 +193,20 @@ class TelegramParser:
                 
                 try:
                     channel = await client.get_entity(channel_name)
-                    channel_title = channel.title if hasattr(channel, 'title') else channel_name
-                    channel_username = channel.username if hasattr(channel, 'username') else channel_name
+                    channel_title = getattr(channel, 'title', None) or channel_name
+                    # ВАЖНО: для приватных каналов / каналов без публичного username
+                    # channel.username == None. hasattr вернёт True, поэтому раньше
+                    # post_url формировался как https://t.me/None/<id>.
+                    # Берём fallback: исходный alias из настроек либо c-формат с id.
+                    channel_username = getattr(channel, 'username', None)
+                    if not channel_username:
+                        # Если пользователь передал alias вида "@somechannel" / "somechannel" —
+                        # используем его. Иначе — приватный канал, работаем через c/<id>/.
+                        if isinstance(channel_name, str) and channel_name.strip().lstrip('@'):
+                            channel_username = channel_name.strip().lstrip('@')
+                        else:
+                            channel_username = None
+                    channel_id = getattr(channel, 'id', None)
                     
                     async for message in client.iter_messages(channel, limit=limit):
                         # Проверяем дату
@@ -101,6 +239,7 @@ class TelegramParser:
                                         session=session,
                                         channel_title=channel_title,
                                         channel_username=channel_username,
+                                        channel_id=channel_id,
                                         message=message,
                                         image_path=image_path
                                     )
@@ -115,46 +254,67 @@ class TelegramParser:
             print(f"\n✓ Парсинг завершен. Собрано постов: {total_posts}")
             return total_posts
     
-    def _save_post_to_db(self, session: Session, channel_title: str, channel_username: str, message, image_path: str):
+    def _save_post_to_db(self, session: Session, channel_title: str, channel_username: str, message, image_path: str, channel_id: int | None = None):
         """Сохранение поста в базу данных."""
-        
-        # Формируем URL поста
-        post_url = f"https://t.me/{channel_username}/{message.id}"
-        
+
+        # Формируем URL поста.
+        # Если у канала есть публичный username — используем https://t.me/<username>/<id>.
+        # Иначе (приватный канал или без алиаса) — используем https://t.me/c/<chat_id>/<id>,
+        # это формат внутренних "приватных" ссылок Telegram.
+        if channel_username and channel_username != 'None':
+            post_url = f"https://t.me/{channel_username}/{message.id}"
+        elif channel_id is not None:
+            # Telegram ожидает "сырой" ID без префикса -100 в публичной ссылке
+            cid = abs(int(channel_id))
+            cid_str = str(cid)
+            if cid_str.startswith('100'):
+                cid_str = cid_str[3:]
+            post_url = f"https://t.me/c/{cid_str}/{message.id}"
+        else:
+            post_url = ''
+
         # Получаем статистику поста
         views = message.views if hasattr(message, 'views') and message.views else 0
         forwards = message.forwards if hasattr(message, 'forwards') and message.forwards else 0
         replies = message.replies.replies if hasattr(message, 'replies') and message.replies else 0
-        
-        # Считаем реакции
+
+        # Считаем реакции + детализируем
         reactions = 0
-        if hasattr(message, 'reactions') and message.reactions:
+        reaction_details = []
+        if hasattr(message, 'reactions') and message.reactions and getattr(message.reactions, 'results', None):
             for reaction in message.reactions.results:
-                reactions += reaction.count
-        
-        # Считаем engagement
+                count = getattr(reaction, 'count', 0) or 0
+                reactions += count
+                emoji = ''
+                ri = getattr(reaction, 'reaction', None)
+                if ri is not None:
+                    emoji = getattr(ri, 'emoticon', '') or getattr(ri, 'document_id', '') or ''
+                reaction_details.append({'reaction': str(emoji), 'count': count})
+
         engagement = forwards + replies + reactions
-        
-        # Считаем ER (engagement rate)
         er = (engagement / views * 100) if views > 0 else 0.0
-        
-        # Проверяем, существует ли уже этот пост
+
+        # Perceptual hash for citation detection (Phase 5)
+        image_hash = compute_phash(image_path) or ''
+
         existing_post = session.query(Post).filter_by(
             channel=channel_title,
             telegram_post_id=message.id
         ).first()
-        
+
         if existing_post:
-            # Обновляем существующий пост
             existing_post.views = views
             existing_post.forwards = forwards
             existing_post.replies = replies
             existing_post.reactions = reactions
             existing_post.engagement = engagement
             existing_post.er = er
+            existing_post.has_reactions = bool(reaction_details)
+            existing_post.reaction_details = json.dumps(reaction_details, ensure_ascii=False)
+            if image_hash and not existing_post.image_hash:
+                existing_post.image_hash = image_hash
             post = existing_post
         else:
-            # Создаем новый пост
             post = Post(
                 channel=channel_title,
                 telegram_post_id=message.id,
@@ -167,15 +327,30 @@ class TelegramParser:
                 engagement=engagement,
                 er=er,
                 image_path=image_path,
-                post_url=post_url
+                post_url=post_url,
+                has_reactions=bool(reaction_details),
+                reaction_details=json.dumps(reaction_details, ensure_ascii=False),
+                image_hash=image_hash,
             )
             session.add(post)
-            session.flush()  # Получаем ID поста
-        
-        # Добавляем изображение, если еще не добавлено
-        if not existing_post:
+            session.flush()  # we need post.id
+
             image = Image(
                 post_id=post.id,
-                file_path=image_path
+                file_path=image_path,
             )
             session.add(image)
+
+        # Cross-channel citation detection (Phase 5) — only for new images
+        if image_hash and not existing_post:
+            try:
+                created = record_citations(
+                    session,
+                    new_post_id=post.id,
+                    new_channel=channel_title,
+                    image_hash=image_hash,
+                )
+                if created:
+                    logger.info("  🔁 Найдено цитирований: %s (post=%s)", created, post.id)
+            except Exception as exc:
+                logger.warning("Citation detection failed for post %s: %s", post.id, exc)

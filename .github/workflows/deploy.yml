@@ -1,0 +1,53 @@
+name: Deploy to Yandex Cloud VPS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Deploy to VPS
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.VPS_HOST || '84.201.150.6' }}
+        username: ${{ secrets.VPS_USER || 'yc-user' }}
+        key: ${{ secrets.YC_SSH_KEY }}
+        script: |
+          set -e
+          cd /apps/neurocreatives
+          git pull origin main
+
+          COMPOSE_FILE=docker-compose.production.yml
+          if [ ! -f "$COMPOSE_FILE" ]; then
+            echo "⚠️  $COMPOSE_FILE not found, falling back to docker-compose.yml"
+            COMPOSE_FILE=docker-compose.yml
+          fi
+
+          docker compose -f "$COMPOSE_FILE" down
+          docker compose -f "$COMPOSE_FILE" build --no-cache
+          docker compose -f "$COMPOSE_FILE" up -d
+
+          echo "⏳ Waiting for app to become healthy..."
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/api/stats > /dev/null; then
+              echo "✅ Healthcheck passed (attempt $i)"
+              break
+            fi
+            sleep 2
+            if [ "$i" = "30" ]; then
+              echo "❌ Healthcheck failed after 60s"
+              docker compose -f "$COMPOSE_FILE" logs --tail=80
+              exit 1
+            fi
+          done
+
+          docker system prune -f
+          docker compose -f "$COMPOSE_FILE" ps
+          echo "✅ Deployment completed!"
