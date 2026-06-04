@@ -696,6 +696,7 @@
             <div class="settings-tabs">
                 <button class="settings-tab active" data-tab="channels">Каналы</button>
                 <button class="settings-tab" data-tab="filters">Фильтры каналов</button>
+                <button class="settings-tab" data-tab="prefilter">Предфильтр</button>
                 <button class="settings-tab" data-tab="prompt">Промпт анализа</button>
                 <button class="settings-tab" data-tab="scheduler">Планировщик</button>
             </div>
@@ -803,6 +804,99 @@
                              style="margin-top:8px;max-height:180px;overflow:auto;font-family:monospace;font-size:12px;background:#fafafa;border:1px solid #eee;border-radius:4px;padding:6px;"></div>
                     </div>
                     <div id="discoveryResults" class="modal-info" style="margin-top:8px"></div>
+                </div>
+
+                <!-- Вкладка: Предфильтр (4-уровневый пайплайн L0/L1/L2) -->
+                <div id="settingsPrefilter" class="settings-panel">
+                    <p class="modal-description">
+                        Умная предфильтрация постов до дорогого AI-анализа. Уровни:
+                        <b>L0</b> — текст/метрики (до скачивания), <b>L1</b> — дедуп по
+                        перцептивному хешу (дубли сворачиваются в самый популярный пост),
+                        <b>L2</b> — дешёвый AI-гейт классификатора.
+                    </p>
+
+                    <div class="form-group">
+                        <label class="filter-label">
+                            <input type="checkbox" id="pfEnabled" checked>
+                            Включить предфильтр L0
+                        </label>
+                    </div>
+
+                    <h4 style="margin:14px 0 6px;">L0 — текст и метрики</h4>
+                    <div class="form-group">
+                        <label class="filter-label">Мин. длина текста (символов)</label>
+                        <input type="number" id="pfMinTextLen" class="settings-input" value="30" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">Стоп-слова (через запятую)</label>
+                        <textarea id="pfStopwords" class="channels-textarea" rows="3"
+                                  placeholder="розыгрыш, конкурс, подпишись, erid"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">Мин. просмотров (0 = без ограничения)</label>
+                        <input type="number" id="pfMinViews" class="settings-input" value="0" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">Мин. ER % (0 = без ограничения)</label>
+                        <input type="number" id="pfMinEr" class="settings-input" value="0" min="0" step="0.1">
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">Языки (через запятую, пусто = любые)</label>
+                        <input type="text" id="pfLanguages" class="settings-input" value="ru, en" placeholder="ru, en">
+                    </div>
+
+                    <h4 style="margin:14px 0 6px;">L1 — дедуп по изображению</h4>
+                    <div class="form-group">
+                        <label class="filter-label">
+                            <input type="checkbox" id="pfDedupeEnabled" checked>
+                            Сворачивать дубли в самый популярный пост
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">Порог Хэмминга (меньше = строже)</label>
+                        <input type="number" id="pfDedupeThreshold" class="settings-input" value="10" min="0" max="64">
+                    </div>
+
+                    <h4 style="margin:14px 0 6px;">L2 — AI-гейт классификатора</h4>
+                    <div class="form-group">
+                        <label class="filter-label">
+                            <input type="checkbox" id="pfAiFilterEnabled" checked>
+                            Включить AI-гейт
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">Мин. solo_image_appeal (0–10)</label>
+                        <input type="number" id="pfAiMinSoloAppeal" class="settings-input" value="4.0" min="0" max="10" step="0.5">
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">
+                            <input type="checkbox" id="pfAiRejectTextScreenshots" checked>
+                            Отклонять скриншоты текста
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">
+                            <input type="checkbox" id="pfAiRejectNewsPhotos" checked>
+                            Отклонять новостные фото
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="filter-label">
+                            <input type="checkbox" id="pfAiRejectUnethical" checked>
+                            Отклонять неэтичный контент
+                        </label>
+                    </div>
+
+                    <h4 style="margin:14px 0 6px;">Воронка предфильтра</h4>
+                    <div id="prefilterStats" class="modal-info">
+                        <div class="loading">Загрузка метрик…</div>
+                    </div>
+                    <div class="form-group" style="margin-top:10px;">
+                        <button id="btnBackfillPrefilter" class="btn btn-secondary" type="button">
+                            🔁 Прогнать backfill по существующим постам
+                        </button>
+                        <span id="backfillStatus" class="modal-info" style="margin-left:8px;"></span>
+                    </div>
                 </div>
 
                 <!-- Вкладка: Промпт анализа -->

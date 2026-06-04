@@ -27,6 +27,19 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("posts", "image_hash", "VARCHAR(64)"),
     ("posts", "citation_count", "INTEGER DEFAULT 0"),
 
+    # Post — smart pre-filter pipeline (L0/L1/L2)
+    ("posts", "prefilter_status", "VARCHAR(20) DEFAULT 'pending'"),
+    ("posts", "prefilter_stage", "VARCHAR(10)"),
+    ("posts", "prefilter_reason", "VARCHAR(500)"),
+    ("posts", "duplicate_of", "INTEGER"),
+    ("posts", "duplicate_count", "INTEGER DEFAULT 0"),
+
+    # ScheduleLog — pre-filter funnel metrics
+    ("schedule_logs", "rejected_l0", "INTEGER DEFAULT 0"),
+    ("schedule_logs", "rejected_l1", "INTEGER DEFAULT 0"),
+    ("schedule_logs", "rejected_l2", "INTEGER DEFAULT 0"),
+    ("schedule_logs", "passed_full", "INTEGER DEFAULT 0"),
+
     # Analysis — classification + tags + target creative + moderation
     ("analysis", "is_ad_creative", "BOOLEAN"),
     ("analysis", "is_text_screenshot", "BOOLEAN DEFAULT FALSE"),
@@ -51,6 +64,8 @@ _INDEX_MIGRATIONS: list[tuple[str, str]] = [
     ("idx_posts_image_hash", "CREATE INDEX IF NOT EXISTS idx_posts_image_hash ON posts (image_hash)"),
     ("idx_posts_channel", "CREATE INDEX IF NOT EXISTS idx_posts_channel ON posts (channel)"),
     ("idx_posts_date", "CREATE INDEX IF NOT EXISTS idx_posts_date ON posts (date)"),
+    ("idx_posts_prefilter_status", "CREATE INDEX IF NOT EXISTS idx_posts_prefilter_status ON posts (prefilter_status)"),
+    ("idx_posts_duplicate_of", "CREATE INDEX IF NOT EXISTS idx_posts_duplicate_of ON posts (duplicate_of)"),
     (
         "idx_citation_pair",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_citation_pair "

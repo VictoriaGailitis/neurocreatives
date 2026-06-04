@@ -58,6 +58,19 @@ class Post(Base):
     image_hash = Column(String(64))          # perceptual phash (hex)
     citation_count = Column(Integer, default=0)
 
+    # Smart pre-filter pipeline (L0/L1/L2/L3)
+    # prefilter_status: pending / passed / rejected / duplicate
+    prefilter_status = Column(String(20), default='pending')
+    # prefilter_stage: на каком уровне отсеян (L0 / L1 / L2) либо passed
+    prefilter_stage = Column(String(10))
+    # prefilter_reason: человекочитаемая причина отсева
+    prefilter_reason = Column(String(500))
+    # duplicate_of: ссылка на «лидера» группы дублей (самый популярный пост),
+    # если этот пост признан near-duplicate на стадии L1.
+    duplicate_of = Column(Integer, ForeignKey('posts.id'), nullable=True)
+    # duplicate_count: сколько дублей свёрнуто в этот пост (актуально для лидера группы).
+    duplicate_count = Column(Integer, default=0)
+
     # Relationships
     images = relationship("Image", back_populates="post", cascade="all, delete-orphan")
     channel_obj = relationship("Channel", back_populates="posts")
@@ -66,6 +79,8 @@ class Post(Base):
 Index('idx_posts_image_hash', Post.image_hash)
 Index('idx_posts_channel', Post.channel)
 Index('idx_posts_date', Post.date)
+Index('idx_posts_prefilter_status', Post.prefilter_status)
+Index('idx_posts_duplicate_of', Post.duplicate_of)
 
 
 class Image(Base):
@@ -163,6 +178,12 @@ class ScheduleLog(Base):
     images_analyzed = Column(Integer, default=0)
     error_message = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Smart pre-filter funnel metrics (per run)
+    rejected_l0 = Column(Integer, default=0)   # отсев на текст/метриках (до скачивания)
+    rejected_l1 = Column(Integer, default=0)   # свёрнуто как дубли (phash)
+    rejected_l2 = Column(Integer, default=0)   # отклонено дешёвым AI-гейтом
+    passed_full = Column(Integer, default=0)   # дошло до полного анализа
 
 
 class SystemLog(Base):

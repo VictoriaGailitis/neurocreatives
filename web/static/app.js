@@ -1394,6 +1394,7 @@ function switchSettingsTab(tabName) {
     const panels = {
         'channels': 'settingsChannels',
         'filters': 'settingsFilters',
+        'prefilter': 'settingsPrefilter',
         'prompt': 'settingsPrompt',
         'scheduler': 'settingsScheduler'
     };
@@ -1401,6 +1402,12 @@ function switchSettingsTab(tabName) {
     const activePanel = document.getElementById(panels[tabName]);
     if (activePanel) {
         activePanel.classList.add('active');
+    }
+
+    // Подгружаем настройки/метрики предфильтра при открытии вкладки.
+    if (tabName === 'prefilter' && typeof window.loadPrefilterSettings === 'function') {
+        window.loadPrefilterSettings();
+        window.loadPrefilterStats();
     }
 }
 
@@ -1416,6 +1423,16 @@ async function saveSettings() {
         // Если активна вкладка планировщика, сохраняем настройки планировщика
         if (activeTab === 'scheduler') {
             await saveScheduleSettings();
+            btn.disabled = false;
+            btn.textContent = 'Сохранить';
+            return;
+        }
+
+        // Вкладка предфильтра — сохраняем её настройки отдельным эндпоинтом.
+        if (activeTab === 'prefilter') {
+            await window.savePrefilterSettings();
+            await window.loadPrefilterStats();
+            alert('Настройки предфильтра сохранены');
             btn.disabled = false;
             btn.textContent = 'Сохранить';
             return;
@@ -1470,6 +1487,112 @@ function updateChannelsCount() {
     const countElement = document.getElementById('channelsCount');
     if (countElement) countElement.textContent = channels.length;
 }
+
+// ===== Предфильтр (L0/L1/L2) — настройки и метрики воронки =====
+
+window.loadPrefilterSettings = async function () {
+    try {
+        const resp = await fetch('/api/prefilter-settings');
+        if (!resp.ok) return;
+        const d = await resp.json();
+        const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+        const chk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
+
+        chk('pfEnabled', d.enabled);
+        set('pfMinTextLen', d.min_text_len ?? 30);
+        set('pfStopwords', d.stopwords ?? '');
+        set('pfMinViews', d.min_views ?? 0);
+        set('pfMinEr', d.min_er ?? 0);
+        set('pfLanguages', d.languages ?? '');
+        chk('pfDedupeEnabled', d.dedupe_enabled);
+        set('pfDedupeThreshold', d.dedupe_threshold ?? 10);
+        chk('pfAiFilterEnabled', d.ai_filter_enabled);
+        set('pfAiMinSoloAppeal', d.ai_min_solo_appeal ?? 4.0);
+        chk('pfAiRejectTextScreenshots', d.ai_reject_text_screenshots);
+        chk('pfAiRejectNewsPhotos', d.ai_reject_news_photos);
+        chk('pfAiRejectUnethical', d.ai_reject_unethical);
+    } catch (e) {
+        console.warn('loadPrefilterSettings failed', e);
+    }
+};
+
+window.savePrefilterSettings = async function () {
+    const val = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
+    const checked = (id) => { const el = document.getElementById(id); return el ? el.checked : false; };
+
+    const payload = {
+        enabled: checked('pfEnabled'),
+        min_text_len: parseInt(val('pfMinTextLen') || '0', 10),
+        stopwords: val('pfStopwords') || '',
+        min_views: parseInt(val('pfMinViews') || '0', 10),
+        min_er: parseFloat(val('pfMinEr') || '0'),
+        languages: val('pfLanguages') || '',
+        dedupe_enabled: checked('pfDedupeEnabled'),
+        dedupe_threshold: parseInt(val('pfDedupeThreshold') || '10', 10),
+        ai_filter_enabled: checked('pfAiFilterEnabled'),
+        ai_min_solo_appeal: parseFloat(val('pfAiMinSoloAppeal') || '0'),
+        ai_reject_text_screenshots: checked('pfAiRejectTextScreenshots'),
+        ai_reject_news_photos: checked('pfAiRejectNewsPhotos'),
+        ai_reject_unethical: checked('pfAiRejectUnethical'),
+    };
+    await fetch('/api/prefilter-settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    });
+};
+
+window.loadPrefilterStats = async function () {
+    const box = document.getElementById('prefilterStats');
+    if (!box) return;
+    try {
+        const resp = await fetch('/api/prefilter-stats');
+        if (!resp.ok) { box.textContent = 'Не удалось загрузить метрики'; return; }
+        const d = await resp.json();
+        const s = d.by_status || {};
+        const f = d.funnel_totals || {};
+        box.innerHTML = `
+            <div style="display:flex;flex-wrap:wrap;gap:14px;">
+                <div>Всего постов: <b>${d.total_posts ?? 0}</b></div>
+                <div>Прошли: <b>${s.passed ?? 0}</b></div>
+                <div>Дубли: <b>${s.duplicate ?? 0}</b></div>
+                <div>Отклонены: <b>${s.rejected ?? 0}</b></div>
+                <div>Ожидают: <b>${s.pending ?? 0}</b></div>
+            </div>
+            <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:14px;">
+                <div>L0 отсев: <b>${f.rejected_l0 ?? 0}</b></div>
+                <div>L1 дубли: <b>${f.rejected_l1 ?? 0}</b></div>
+                <div>L2 отсев: <b>${f.rejected_l2 ?? 0}</b></div>
+                <div>Полный анализ: <b>${f.passed_full ?? 0}</b></div>
+            </div>`;
+    } catch (e) {
+        box.textContent = 'Ошибка загрузки метрик';
+        console.warn('loadPrefilterStats failed', e);
+    }
+};
+
+window.runPrefilterBackfill = async function () {
+    const label = document.getElementById('backfillStatus');
+    const btn = document.getElementById('btnBackfillPrefilter');
+    if (btn) btn.disabled = true;
+    if (label) label.textContent = 'Выполняется…';
+    try {
+        const resp = await fetch('/api/prefilter-backfill', { method: 'POST' });
+        const d = await resp.json();
+        if (resp.ok) {
+            if (label) label.textContent =
+                `Готово: обработано ${d.processed ?? 0}, дубли ${d.duplicates ?? 0}`;
+            await window.loadPrefilterStats();
+        } else {
+            if (label) label.textContent = `Ошибка: ${d.detail || 'не удалось'}`;
+        }
+    } catch (e) {
+        if (label) label.textContent = 'Ошибка backfill';
+        console.warn('runPrefilterBackfill failed', e);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+};
 
 // ===== Bulk-add / single-add для реестра каналов =====
 
@@ -2223,6 +2346,10 @@ function filterLogs() {
         attachSearchBindings();
         // Pre-load once so values are populated when tab is opened
         loadChannelFilters();
+
+        // Кнопка backfill предфильтра.
+        const backfillBtn = $('btnBackfillPrefilter');
+        if (backfillBtn) backfillBtn.addEventListener('click', window.runPrefilterBackfill);
     }
 
     if (document.readyState === 'loading') {

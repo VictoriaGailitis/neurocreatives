@@ -631,7 +631,11 @@ async def run_parser_task(run_type: str = 'manual'):
             parse_depth=parse_depth,
             parse_from_date=parse_from_date
         )
-        
+
+        # Метрики воронки предфильтра (L0 отсев — посчитан парсером).
+        run_stats = getattr(parser, 'last_run_stats', {}) or {}
+        rejected_l0 = int(run_stats.get('rejected_l0', 0) or 0)
+
         # Логируем результат в БД
         with db.get_session() as session:
             log_entry = ScheduleLog(
@@ -639,7 +643,8 @@ async def run_parser_task(run_type: str = 'manual'):
                 run_type=run_type,
                 status='success',
                 images_parsed=count,
-                images_analyzed=0
+                images_analyzed=0,
+                rejected_l0=rejected_l0,
             )
             session.add(log_entry)
             session.commit()
@@ -711,12 +716,15 @@ async def get_job_status():
     }
 
 
-def _run_analysis_blocking() -> int:
+def _run_analysis_blocking() -> dict:
     """Синхронный анализ — выполняется в отдельном потоке, чтобы НЕ блокировать
     event loop FastAPI (иначе `/api/job-status`, `/api/logs/stream`, любые другие
-    запросы и сам UI «зависают» до конца анализа)."""
+    запросы и сам UI «зависают» до конца анализа).
+
+    Возвращает dict-метрики воронки (rejected_l1/l2, passed_full, total).
+    """
     analyzer = ImageAnalyzer()
-    return analyzer.analyze_all_unanalyzed()
+    return analyzer.analyze_all_unanalyzed(return_metrics=True)
 
 
 async def run_analysis_task():
@@ -735,14 +743,38 @@ async def run_analysis_task():
         logger.info("🔍 Запуск AI анализа изображений...")
 
         # Анализатор получает OpenAI API ключ из переменной окружения OPENAI_API_KEY (.env).
-        count = await asyncio.to_thread(_run_analysis_blocking)
+        metrics = await asyncio.to_thread(_run_analysis_blocking)
+        count = int(metrics.get("passed_full", 0) or 0)
+
+        # Записываем метрики воронки (стадии L1/L2/L3) отдельной строкой лога.
+        try:
+            db = get_database()
+            with db.get_session() as session:
+                session.add(ScheduleLog(
+                    timestamp=datetime.utcnow(),
+                    run_type="manual",
+                    status="success",
+                    images_parsed=0,
+                    images_analyzed=count,
+                    rejected_l1=int(metrics.get("rejected_l1", 0) or 0),
+                    rejected_l2=int(metrics.get("rejected_l2", 0) or 0),
+                    passed_full=count,
+                ))
+                session.commit()
+        except Exception as log_exc:  # pragma: no cover - defensive
+            logger.warning("Failed to write analysis funnel log: %s", log_exc)
 
         _job_finished(
             analysis_status,
             f"Анализ завершён. Проанализировано: {count}",
             success=True,
         )
-        add_log("INFO", f"✅ Анализ завершен. Проанализировано: {count}")
+        add_log(
+            "INFO",
+            f"✅ Анализ завершен. passed_full={count}, "
+            f"rejected_l1={metrics.get('rejected_l1', 0)}, "
+            f"rejected_l2={metrics.get('rejected_l2', 0)}",
+        )
         logger.info(f"✅ Анализ завершен. Проанализировано: {count}")
 
     except Exception as e:
@@ -1179,7 +1211,12 @@ async def get_schedule_logs(
                 'status': log.status,
                 'images_parsed': log.images_parsed,
                 'images_analyzed': log.images_analyzed,
-                'error_message': log.error_message
+                'error_message': log.error_message,
+                # Метрики воронки предфильтра.
+                'rejected_l0': getattr(log, 'rejected_l0', 0) or 0,
+                'rejected_l1': getattr(log, 'rejected_l1', 0) or 0,
+                'rejected_l2': getattr(log, 'rejected_l2', 0) or 0,
+                'passed_full': getattr(log, 'passed_full', 0) or 0,
             })
         
         return {
@@ -2070,6 +2107,183 @@ async def update_channel_filters(
             db.add(Settings(key=db_key, value=value_str))
     db.commit()
     return {"status": "success"}
+
+
+# =====================================================================
+# Smart pre-filter settings & funnel stats (L0/L1/L2 pipeline)
+# =====================================================================
+
+# Маппинг L2 (AI-гейт) ключей: UI-имя -> ключ в Settings.
+_L2_SETTING_KEYS = {
+    "ai_filter_enabled": ("bool", "true"),
+    "ai_min_solo_appeal": ("float", "4.0"),
+    "ai_reject_text_screenshots": ("bool", "true"),
+    "ai_reject_news_photos": ("bool", "true"),
+    "ai_reject_unethical": ("bool", "true"),
+}
+
+
+@app.get("/api/prefilter-settings")
+async def get_prefilter_settings(db: Session = Depends(get_db_session)):
+    """Текущие настройки предфильтра (L0/L1 + L2 AI-гейт) с дефолтами."""
+    from ai.prefilter import PrefilterConfig
+
+    cfg = PrefilterConfig.from_settings()
+
+    # L2 (ai_*) читаем напрямую из Settings.
+    l2_rows = {
+        s.key: s.value
+        for s in db.query(Settings)
+        .filter(Settings.key.in_(list(_L2_SETTING_KEYS.keys())))
+        .all()
+    }
+
+    def _l2_val(key):
+        kind, default = _L2_SETTING_KEYS[key]
+        raw = l2_rows.get(key, default)
+        if kind == "bool":
+            return str(raw).lower() == "true"
+        if kind == "float":
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return float(default)
+        return raw
+
+    return {
+        # L0 — текст/метрики
+        "enabled": cfg.enabled,
+        "min_text_len": cfg.min_text_len,
+        "stopwords": ", ".join(cfg.stopwords),
+        "min_views": cfg.min_views,
+        "min_er": cfg.min_er,
+        "languages": ", ".join(cfg.languages),
+        # L1 — phash-дедуп
+        "dedupe_enabled": cfg.dedupe_enabled,
+        "dedupe_threshold": cfg.dedupe_threshold,
+        # L2 — AI-гейт
+        "ai_filter_enabled": _l2_val("ai_filter_enabled"),
+        "ai_min_solo_appeal": _l2_val("ai_min_solo_appeal"),
+        "ai_reject_text_screenshots": _l2_val("ai_reject_text_screenshots"),
+        "ai_reject_news_photos": _l2_val("ai_reject_news_photos"),
+        "ai_reject_unethical": _l2_val("ai_reject_unethical"),
+    }
+
+
+@app.post("/api/prefilter-settings")
+async def update_prefilter_settings(
+    payload: Dict[str, Any],
+    db: Session = Depends(get_db_session),
+):
+    """Сохранить настройки предфильтра. Принимает любое подмножество полей."""
+
+    def _set(db_key: str, value: Any):
+        if isinstance(value, bool):
+            value_str = "true" if value else "false"
+        elif isinstance(value, list):
+            value_str = ", ".join(str(x) for x in value)
+        else:
+            value_str = str(value)
+        row = db.query(Settings).filter(Settings.key == db_key).first()
+        if row:
+            row.value = value_str
+        else:
+            db.add(Settings(key=db_key, value=value_str))
+
+    # L0 / L1 настройки предфильтра.
+    prefilter_map = {
+        "enabled": "prefilter_enabled",
+        "min_text_len": "prefilter_min_text_len",
+        "stopwords": "prefilter_stopwords",
+        "min_views": "prefilter_min_views",
+        "min_er": "prefilter_min_er",
+        "languages": "prefilter_languages",
+        "dedupe_enabled": "prefilter_dedupe_enabled",
+        "dedupe_threshold": "prefilter_dedupe_threshold",
+    }
+    for in_key, db_key in prefilter_map.items():
+        if in_key in payload:
+            _set(db_key, payload[in_key])
+
+    # L2 (AI-гейт) настройки.
+    for key in _L2_SETTING_KEYS:
+        if key in payload:
+            _set(key, payload[key])
+
+    db.commit()
+    return {"status": "success"}
+
+
+@app.get("/api/prefilter-stats")
+async def get_prefilter_stats(db: Session = Depends(get_db_session)):
+    """Метрики воронки предфильтра: распределение постов по статусам и
+    суммарные счётчики стадий за последние запуски."""
+    from sqlalchemy import func
+
+    # Распределение постов по prefilter_status.
+    status_rows = (
+        db.query(Post.prefilter_status, func.count(Post.id))
+        .group_by(Post.prefilter_status)
+        .all()
+    )
+    by_status = {(s or "pending"): int(c) for s, c in status_rows}
+
+    total_posts = db.query(func.count(Post.id)).scalar() or 0
+
+    # Суммарные счётчики воронки по последним записям ScheduleLog.
+    agg = db.query(
+        func.coalesce(func.sum(ScheduleLog.rejected_l0), 0),
+        func.coalesce(func.sum(ScheduleLog.rejected_l1), 0),
+        func.coalesce(func.sum(ScheduleLog.rejected_l2), 0),
+        func.coalesce(func.sum(ScheduleLog.passed_full), 0),
+    ).first()
+
+    return {
+        "total_posts": int(total_posts),
+        "by_status": {
+            "pending": by_status.get("pending", 0),
+            "passed": by_status.get("passed", 0),
+            "rejected": by_status.get("rejected", 0),
+            "duplicate": by_status.get("duplicate", 0),
+        },
+        "funnel_totals": {
+            "rejected_l0": int(agg[0] or 0),
+            "rejected_l1": int(agg[1] or 0),
+            "rejected_l2": int(agg[2] or 0),
+            "passed_full": int(agg[3] or 0),
+        },
+    }
+
+
+def _run_prefilter_backfill_blocking() -> dict:
+    """Прогон существующих постов через L0+L1 предфильтр. Блокирующая операция,
+    запускается в отдельном потоке (см. эндпоинт)."""
+    from ai.prefilter import PrefilterConfig, backfill_prefilter
+
+    db = get_database()
+    cfg = PrefilterConfig.from_settings()
+    with db.get_session() as session:
+        return backfill_prefilter(session, cfg=cfg)
+
+
+@app.post("/api/prefilter-backfill")
+async def prefilter_backfill():
+    """Идемпотентно размечает уже существующие посты предфильтром (L0+L1).
+
+    Безопасно запускать повторно: обрабатываются только посты в статусе
+    ``pending``. Возвращает ``{"processed", "duplicates"}``.
+    """
+    try:
+        result = await asyncio.to_thread(_run_prefilter_backfill_blocking)
+        add_log("info", (
+            f"Backfill предфильтра завершён: обработано {result.get('processed', 0)}, "
+            f"дубли {result.get('duplicates', 0)}"
+        ))
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка backfill предфильтра: {e}")
+        add_log("error", f"Ошибка backfill предфильтра: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =====================================================================

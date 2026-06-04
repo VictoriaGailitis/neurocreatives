@@ -149,6 +149,128 @@ def record_citations(
     return created
 
 
+def _post_popularity(post) -> tuple:
+    """Ключ популярности поста: больше engagement, затем ER, затем просмотры.
+
+    Используется для выбора «лидера» группы дублей.
+    """
+    return (
+        post.engagement or 0,
+        post.er or 0.0,
+        post.views or 0,
+    )
+
+
+def find_duplicate_group_leader(
+    session: Session,
+    image_hash: str,
+    *,
+    exclude_post_id: Optional[int] = None,
+    threshold: int = 10,
+):
+    """Найти «лидера» группы near-duplicate постов по перцептивному хешу.
+
+    В отличие от :func:`find_similar_posts` (кросс-канальные цитирования),
+    дедуп L1 работает по ВСЕМ каналам: одинаковый креатив, где бы он ни был
+    запощен, сворачивается в один самый популярный пост.
+
+    Возвращает объект ``Post`` — лидера группы (самый популярный среди
+    найденных дублей), либо ``None``, если дублей нет.
+    """
+    from db.models import Post
+
+    if not image_hash:
+        return None
+
+    query = session.query(Post).filter(
+        Post.image_hash.isnot(None),
+        Post.image_hash != "",
+    )
+    if exclude_post_id is not None:
+        query = query.filter(Post.id != exclude_post_id)
+
+    candidates = []
+    for post in query.limit(5000).all():
+        dist = hamming_distance(image_hash, post.image_hash)
+        if dist <= threshold:
+            candidates.append(post)
+
+    if not candidates:
+        return None
+
+    # «Лидер» — самый популярный среди уже существующих near-duplicate постов.
+    candidates.sort(key=_post_popularity, reverse=True)
+    return candidates[0]
+
+
+def collapse_into_leader(session: Session, new_post, leader) -> object:
+    """Свернуть дубли так, чтобы лидером был самый популярный пост.
+
+    Сравнивает популярность ``new_post`` и текущего ``leader``:
+
+      * если новый пост популярнее — лидерство переходит к нему: бывший лидер
+        и все его дубли перецепляются на новый пост;
+      * иначе — новый пост помечается как дубль лидера.
+
+    Возвращает актуального лидера группы (на случай смены лидерства).
+    Проставляет ``prefilter_status='duplicate'`` и ``duplicate_of`` у
+    проигравших, а у лидера накапливает ``duplicate_count``.
+    """
+    from db.models import Post
+
+    # Поднимаемся к корню группы, если leader сам оказался дублем.
+    leader = _resolve_root_leader(session, leader)
+
+    new_pop = _post_popularity(new_post)
+    leader_pop = _post_popularity(leader)
+
+    if new_pop > leader_pop:
+        # Смена лидера: переносим бывшего лидера и его дубли на new_post.
+        followers = (
+            session.query(Post)
+            .filter(Post.duplicate_of == leader.id)
+            .all()
+        )
+        for f in followers:
+            f.duplicate_of = new_post.id
+            f.prefilter_status = "duplicate"
+            f.prefilter_stage = "L1"
+
+        leader.duplicate_of = new_post.id
+        leader.prefilter_status = "duplicate"
+        leader.prefilter_stage = "L1"
+
+        new_post.prefilter_status = "passed"
+        new_post.duplicate_of = None
+        new_post.duplicate_count = (leader.duplicate_count or 0) + len(followers) + 1
+        leader.duplicate_count = 0
+        return new_post
+
+    # Лидер остаётся прежним; new_post — дубль.
+    new_post.duplicate_of = leader.id
+    new_post.prefilter_status = "duplicate"
+    new_post.prefilter_stage = "L1"
+    leader.duplicate_count = (leader.duplicate_count or 0) + 1
+    return leader
+
+
+def _resolve_root_leader(session: Session, post):
+    """Идём по цепочке duplicate_of вверх до корневого лидера группы."""
+    from db.models import Post
+
+    seen = set()
+    current = post
+    while current is not None and current.duplicate_of:
+        if current.id in seen:  # защита от циклов
+            break
+        seen.add(current.id)
+        parent = session.query(Post).filter(Post.id == current.duplicate_of).first()
+        if parent is None:
+            break
+        current = parent
+    return current
+
+
 def backfill_hashes(session: Session, batch_size: int = 200) -> int:
     """Compute pHash for every existing post that has an image but no hash."""
     from db.models import Image as ImageModel

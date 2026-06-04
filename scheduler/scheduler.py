@@ -62,65 +62,31 @@ def _run_scheduled_task():
 
 def _run_analysis_task():
     """
-    Выполнение задачи анализа изображений.
-    Анализирует небольшую порцию необработанных изображений (до 20 за раз).
+    Выполнение задачи анализа изображений через единый оркестратор пайплайна.
+
+    Раньше здесь вызывался «сырой» ``analyze_image`` в обход AI-гейта (L2),
+    из-за чего планировщик анализировал нерелевантные креативы. Теперь
+    используется тот же путь L1→L2→L3, что и в ручном запуске
+    (:meth:`ImageAnalyzer.analyze_all_unanalyzed`).
+
+    Возвращает dict-метрики воронки (rejected_l1/l2, passed_full) для записи
+    в ``ScheduleLog`` вызывающим кодом.
     """
-    logger.info("🔍 Запуск задачи анализа изображений...")
-    
+    logger.info("🔍 Запуск задачи анализа изображений (пайплайн L1→L2→L3)...")
+
     try:
-        from db.database import get_database
-        from db.models import Image, Analysis
-        
-        db = get_database()
-        
-        with db.get_session() as session:
-            # Находим до 20 изображений без анализа
-            images = session.query(Image).outerjoin(Analysis).filter(
-                Analysis.id == None
-            ).limit(20).all()
-            
-            total = len(images)
-            if total == 0:
-                logger.info("✅ Все изображения уже проанализированы")
-                return
-            
-            logger.info(f"🔍 Найдено {total} изображений для анализа")
-            
-            # Создаем анализатор
-            analyzer = ImageAnalyzer()
-            
-            analyzed = 0
-            for idx, image in enumerate(images, 1):
-                logger.info(f"[{idx}/{total}] Анализ изображения ID: {image.id}")
-                
-                result = analyzer.analyze_image(image.file_path)
-                
-                if result:
-                    # Сохраняем результат в БД
-                    analysis = Analysis(
-                        image_id=image.id,
-                        scene=result.get('scene', ''),
-                        objects=result.get('objects', ''),
-                        emotion=result.get('emotion', ''),
-                        creative_type=result.get('type', ''),
-                        text_present=result.get('text_present', ''),
-                        visual_strength_score=result.get('visual_strength_score', 0)
-                    )
-                    session.add(analysis)
-                    session.commit()
-                    analyzed += 1
-                    logger.info(f"✓ Анализ сохранен")
-                else:
-                    logger.warning(f"⚠️ Не удалось проанализировать изображение ID: {image.id}")
-                
-                # Задержка между запросами для соблюдения rate limit
-                if idx < total:
-                    time.sleep(1)
-            
-            logger.info(f"✅ Анализ завершен: {analyzed}/{total} изображений")
-            
+        analyzer = ImageAnalyzer()
+        metrics = analyzer.analyze_all_unanalyzed(return_metrics=True)
+        logger.info(
+            "✅ Анализ завершён: passed_full=%s, rejected_l1=%s, rejected_l2=%s",
+            metrics.get("passed_full", 0),
+            metrics.get("rejected_l1", 0),
+            metrics.get("rejected_l2", 0),
+        )
+        return metrics
     except Exception as e:
         logger.error(f"❌ Ошибка при выполнении задачи анализа: {e}", exc_info=True)
+        return {"rejected_l1": 0, "rejected_l2": 0, "passed_full": 0, "total": 0}
 
 
 def _get_schedule_settings() -> Dict[str, Any]:

@@ -27,8 +27,10 @@ from ai.image_classifier import (
     ImageClassifier,
     evaluate,
 )
+from ai.image_similarity import collapse_into_leader, find_duplicate_group_leader
+from ai.prefilter import PrefilterConfig
 from db.database import get_database
-from db.models import Analysis, Image, Settings
+from db.models import Analysis, Image, Post, Settings
 
 logger = logging.getLogger(__name__)
 
@@ -241,8 +243,19 @@ Be concise. Answer in Russian."""
 
     # ---------- batch driver ----------
 
-    def analyze_all_unanalyzed(self):
-        """Run two-stage pipeline on every image without analysis yet."""
+    def analyze_all_unanalyzed(self, return_metrics: bool = False):
+        """Единый оркестратор пайплайна L1 → L2 → L3 по всем не разобранным фото.
+
+        Стадии:
+          * **L1** (phash-дедуп) — near-duplicate сворачивается в самый
+            популярный пост группы; такие фото НЕ анализируются (экономия AI).
+          * **L2** (обязательный AI-гейт ``ImageClassifier`` + ``evaluate``) —
+            отсев нерелевантных креативов (скриншоты текста, новости, этика…).
+          * **L3** (полный анализ ``analyze_image``) — только для прошедших L2.
+
+        Возвращает ``int`` (число прошедших полный анализ) для обратной
+        совместимости, либо dict-метрики воронки при ``return_metrics=True``.
+        """
         db = get_database()
 
         # Build the classifier once (shares api_key)
@@ -252,19 +265,29 @@ Be concise. Answer in Russian."""
             logger.warning("Classifier disabled, running full analysis only: %s", exc)
             classifier = None
         filter_cfg = FilterConfig.from_settings()
+        prefilter_cfg = PrefilterConfig.from_settings()
+
+        metrics = {"rejected_l1": 0, "rejected_l2": 0, "passed_full": 0, "total": 0}
 
         with db.get_session() as session:
+            # Берём только фото без анализа, чей пост ещё не отсеян на L0/L1.
             images = (
                 session.query(Image)
                 .outerjoin(Analysis)
+                .outerjoin(Post, Image.post_id == Post.id)
                 .filter(Analysis.id == None)  # noqa: E711
+                .filter(
+                    (Post.id == None)  # noqa: E711
+                    | (Post.prefilter_status.notin_(["duplicate", "rejected"]))
+                )
                 .all()
             )
 
             total = len(images)
+            metrics["total"] = total
             if total == 0:
                 print("✓ Все изображения уже проанализированы")
-                return 0
+                return metrics if return_metrics else 0
 
             print(f"🔍 Найдено {total} изображений для анализа")
             analyzed = 0
@@ -274,7 +297,33 @@ Be concise. Answer in Russian."""
                 print(f"\n[{idx}/{total}] Анализ изображения ID: {image.id}")
                 print(f"  Файл: {image.file_path}")
 
-                # Stage 1: classification gate
+                post = image.post
+
+                # ---- L1: phash-дедуп (сворачивание в лидера группы) ----
+                if (
+                    prefilter_cfg.dedupe_enabled
+                    and post is not None
+                    and post.image_hash
+                ):
+                    leader = find_duplicate_group_leader(
+                        session,
+                        post.image_hash,
+                        exclude_post_id=post.id,
+                        threshold=prefilter_cfg.dedupe_threshold,
+                    )
+                    if leader is not None:
+                        actual_leader = collapse_into_leader(session, post, leader)
+                        if actual_leader.id != post.id:
+                            # Текущий пост стал дублем — анализ не нужен.
+                            metrics["rejected_l1"] += 1
+                            session.commit()
+                            print(
+                                f"  🧬 L1 дубль → свёрнут в пост #{actual_leader.id}"
+                            )
+                            continue
+                        # Иначе пост — новый лидер группы, продолжаем к L2/L3.
+
+                # ---- L2: обязательный AI-гейт классификатора ----
                 cls_result: Optional[ClassificationResult] = None
                 if classifier is not None:
                     cls_result = classifier.classify(image.file_path)
@@ -288,7 +337,7 @@ Be concise. Answer in Russian."""
                 full_result = None
                 target_description = None
                 if decision is None or decision.accepted:
-                    # Stage 2: full creative analysis
+                    # ---- L3: полный анализ креатива ----
                     full_result = self.analyze_image(image.file_path)
                     # Phase 4: target description генерируется только если изображение
                     # действительно подходит на роль «целевого креатива».
@@ -302,7 +351,8 @@ Be concise. Answer in Russian."""
                               "не генерируется (не подходит как целевой креатив)")
                 else:
                     rejected += 1
-                    print(f"  🚫 Отклонено фильтром: {decision.reason}")
+                    metrics["rejected_l2"] += 1
+                    print(f"  🚫 L2 отклонено фильтром: {decision.reason}")
 
                 # Persist analysis row regardless — store classification + filter decision
                 self._save_analysis(
@@ -313,20 +363,33 @@ Be concise. Answer in Russian."""
                     rejected_reason=decision.reason if decision and not decision.accepted else "",
                     target_description=target_description,
                 )
+
+                # Отражаем итог стадий L2/L3 в статусе предфильтра поста.
+                if post is not None:
+                    if decision is not None and not decision.accepted:
+                        post.prefilter_status = "rejected"
+                        post.prefilter_stage = "L2"
+                        post.prefilter_reason = (decision.reason or "")[:500]
+                    else:
+                        post.prefilter_status = "passed"
+                        post.prefilter_stage = "L3"
+
                 session.commit()
 
                 if full_result is not None:
                     analyzed += 1
+                    metrics["passed_full"] += 1
                     print("  ✓ Анализ сохранён")
 
                 if idx < total:
                     time.sleep(0.6)
 
             print(
-                f"\n✓ Анализ завершён: full_analyzed={analyzed}, "
-                f"rejected_by_filter={rejected}, total={total}"
+                f"\n✓ Анализ завершён: passed_full={analyzed}, "
+                f"rejected_l1={metrics['rejected_l1']}, "
+                f"rejected_l2={rejected}, total={total}"
             )
-            return analyzed
+            return metrics if return_metrics else analyzed
 
     # ---------- persistence ----------
 

@@ -10,6 +10,7 @@ from telethon import connection as tl_connection
 from sqlalchemy.orm import Session
 
 from ai.image_similarity import compute_phash, record_citations
+from ai.prefilter import PostMeta, PrefilterConfig, evaluate_text_metrics
 from db.database import get_database
 from db.models import Image, Post
 
@@ -134,6 +135,9 @@ class TelegramParser:
             self.session_name = session_name
         self.downloads_folder = 'downloads'
 
+        # Статистика последнего прогона (для воронки предфильтра).
+        self.last_run_stats = {'collected': 0, 'rejected_l0': 0}
+
         # Build proxy configuration from env
         self.connection_cls, self.proxy = _build_proxy()
     
@@ -186,7 +190,11 @@ class TelegramParser:
                 print(f"📅 Парсинг за сегодня ({today})")
             
             total_posts = 0
+            rejected_l0 = 0
             db = get_database()
+
+            # L0-предфильтр: единый конфиг на весь прогон парсинга.
+            prefilter_cfg = PrefilterConfig.from_settings()
             
             for channel_name in channels:
                 print(f"\n📡 Парсинг канала: {channel_name}")
@@ -228,6 +236,32 @@ class TelegramParser:
                         # Проверяем наличие текста и фото
                         if message.text and message.photo:
                             print(f"  📥 Найден пост ID: {message.id}")
+
+                            # L0 — дешёвый отсев по тексту/метрикам ДО скачивания.
+                            metrics = self._extract_metrics(message)
+                            decision = evaluate_text_metrics(
+                                PostMeta(
+                                    text=message.text or '',
+                                    views=metrics['views'],
+                                    er=metrics['er'],
+                                ),
+                                prefilter_cfg,
+                            )
+                            if not decision.accepted:
+                                # Не скачиваем медиа: лёгкая rejected-запись для воронки.
+                                with db.get_session() as session:
+                                    self._save_rejected_post(
+                                        session=session,
+                                        channel_title=channel_title,
+                                        channel_username=channel_username,
+                                        channel_id=channel_id,
+                                        message=message,
+                                        metrics=metrics,
+                                        reason=decision.reason,
+                                    )
+                                rejected_l0 += 1
+                                print(f"  ⛔ L0 отсев: {decision.reason}")
+                                continue
                             
                             # Скачиваем изображение
                             image_path = await message.download_media(file=self.downloads_folder)
@@ -241,7 +275,8 @@ class TelegramParser:
                                         channel_username=channel_username,
                                         channel_id=channel_id,
                                         message=message,
-                                        image_path=image_path
+                                        image_path=image_path,
+                                        metrics=metrics,
                                     )
                                 
                                 total_posts += 1
@@ -251,29 +286,38 @@ class TelegramParser:
                     print(f"  ❌ Ошибка при парсинге {channel_name}: {e}")
                     continue
             
-            print(f"\n✓ Парсинг завершен. Собрано постов: {total_posts}")
+            print(
+                f"\n✓ Парсинг завершен. Собрано постов: {total_posts}, "
+                f"отклонено на L0: {rejected_l0}"
+            )
+            self.last_run_stats = {'collected': total_posts, 'rejected_l0': rejected_l0}
             return total_posts
     
-    def _save_post_to_db(self, session: Session, channel_title: str, channel_username: str, message, image_path: str, channel_id: int | None = None):
-        """Сохранение поста в базу данных."""
+    @staticmethod
+    def _build_post_url(channel_username, channel_id, message_id) -> str:
+        """Формируем URL поста.
 
-        # Формируем URL поста.
-        # Если у канала есть публичный username — используем https://t.me/<username>/<id>.
-        # Иначе (приватный канал или без алиаса) — используем https://t.me/c/<chat_id>/<id>,
-        # это формат внутренних "приватных" ссылок Telegram.
+        Если у канала есть публичный username — https://t.me/<username>/<id>.
+        Иначе (приватный канал или без алиаса) — https://t.me/c/<chat_id>/<id>,
+        это формат внутренних "приватных" ссылок Telegram.
+        """
         if channel_username and channel_username != 'None':
-            post_url = f"https://t.me/{channel_username}/{message.id}"
-        elif channel_id is not None:
+            return f"https://t.me/{channel_username}/{message_id}"
+        if channel_id is not None:
             # Telegram ожидает "сырой" ID без префикса -100 в публичной ссылке
             cid = abs(int(channel_id))
             cid_str = str(cid)
             if cid_str.startswith('100'):
                 cid_str = cid_str[3:]
-            post_url = f"https://t.me/c/{cid_str}/{message.id}"
-        else:
-            post_url = ''
+            return f"https://t.me/c/{cid_str}/{message_id}"
+        return ''
 
-        # Получаем статистику поста
+    @staticmethod
+    def _extract_metrics(message) -> dict:
+        """Считает метрики поста (views/ER/реакции) из сообщения Telethon.
+
+        Доступно ДО скачивания медиа — используется и для L0, и при сохранении.
+        """
         views = message.views if hasattr(message, 'views') and message.views else 0
         forwards = message.forwards if hasattr(message, 'forwards') and message.forwards else 0
         replies = message.replies.replies if hasattr(message, 'replies') and message.replies else 0
@@ -293,6 +337,66 @@ class TelegramParser:
 
         engagement = forwards + replies + reactions
         er = (engagement / views * 100) if views > 0 else 0.0
+        return {
+            'views': views,
+            'forwards': forwards,
+            'replies': replies,
+            'reactions': reactions,
+            'engagement': engagement,
+            'er': er,
+            'reaction_details': reaction_details,
+        }
+
+    def _save_rejected_post(self, session: Session, channel_title: str, channel_username: str, message, metrics: dict, reason: str, channel_id: int | None = None):
+        """Лёгкая запись об отклонённом на L0 посте — без скачивания медиа.
+
+        Нужна для аналитики воронки предфильтра. Если пост уже сохранён
+        (например, ранее прошёл фильтр) — не трогаем его.
+        """
+        existing = session.query(Post).filter_by(
+            channel=channel_title,
+            telegram_post_id=message.id,
+        ).first()
+        if existing is not None:
+            return
+
+        post = Post(
+            channel=channel_title,
+            telegram_post_id=message.id,
+            text=message.text,
+            date=message.date,
+            views=metrics['views'],
+            forwards=metrics['forwards'],
+            replies=metrics['replies'],
+            reactions=metrics['reactions'],
+            engagement=metrics['engagement'],
+            er=metrics['er'],
+            image_path='',
+            post_url=self._build_post_url(channel_username, channel_id, message.id),
+            has_reactions=bool(metrics['reaction_details']),
+            reaction_details=json.dumps(metrics['reaction_details'], ensure_ascii=False),
+            image_hash='',
+            prefilter_status='rejected',
+            prefilter_stage='L0',
+            prefilter_reason=(reason or '')[:500],
+        )
+        session.add(post)
+
+    def _save_post_to_db(self, session: Session, channel_title: str, channel_username: str, message, image_path: str, channel_id: int | None = None, metrics: dict | None = None):
+        """Сохранение поста в базу данных."""
+
+        post_url = self._build_post_url(channel_username, channel_id, message.id)
+
+        # Метрики могли быть посчитаны на стадии L0 — переиспользуем, иначе считаем.
+        if metrics is None:
+            metrics = self._extract_metrics(message)
+        views = metrics['views']
+        forwards = metrics['forwards']
+        replies = metrics['replies']
+        reactions = metrics['reactions']
+        engagement = metrics['engagement']
+        er = metrics['er']
+        reaction_details = metrics['reaction_details']
 
         # Perceptual hash for citation detection (Phase 5)
         image_hash = compute_phash(image_path) or ''
@@ -313,6 +417,15 @@ class TelegramParser:
             existing_post.reaction_details = json.dumps(reaction_details, ensure_ascii=False)
             if image_hash and not existing_post.image_hash:
                 existing_post.image_hash = image_hash
+            if not existing_post.image_path:
+                existing_post.image_path = image_path
+            # Пост ранее был отклонён на L0, но теперь прошёл фильтр — реабилитируем.
+            if existing_post.prefilter_status == 'rejected':
+                existing_post.prefilter_status = 'pending'
+                existing_post.prefilter_stage = None
+                existing_post.prefilter_reason = None
+                if not existing_post.images:
+                    session.add(Image(post_id=existing_post.id, file_path=image_path))
             post = existing_post
         else:
             post = Post(
