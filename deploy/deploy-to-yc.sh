@@ -30,7 +30,7 @@ ssh -i $SSH_KEY $VPS_USER@$VPS_HOST << 'ENDSSH'
         git pull origin main
     else
         echo "📥 Клонирование репозитория..."
-        git clone https://github.com/ZdravoHvalaKesaNeTreba/neurocreatives.git
+        git clone https://github.com/VictoriaGailitis/neurocreatives.git
         cd neurocreatives
     fi
     
