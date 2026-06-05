@@ -27,6 +27,7 @@ ssh -i $SSH_KEY $VPS_USER@$VPS_HOST << 'ENDSSH'
     set -e
 
     COMPOSE_FILE="docker-compose.production.yml"
+    REPO_URL="https://github.com/VictoriaGailitis/neurocreatives.git"
 
     echo "📁 Создание директории приложения..."
     sudo mkdir -p /apps/neurocreatives
@@ -38,10 +39,11 @@ ssh -i $SSH_KEY $VPS_USER@$VPS_HOST << 'ENDSSH'
     if [ -d "neurocreatives/.git" ]; then
         echo "📥 Обновление репозитория..."
         cd neurocreatives
+        git remote set-url origin "$REPO_URL"
         git pull origin main
     else
         echo "📥 Клонирование репозитория..."
-        git clone https://github.com/VictoriaGailitis/neurocreatives.git
+        git clone "$REPO_URL"
         cd neurocreatives
     fi
 

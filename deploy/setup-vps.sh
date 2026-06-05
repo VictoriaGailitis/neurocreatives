@@ -44,7 +44,7 @@ sudo chown -R $USER:$USER /opt/neurocreatives
 # Клонирование репозитория
 echo "📥 Клонирование репозитория..."
 cd /opt
-git clone https://github.com/ZdravoHvalaKesaNeTreba/neurocreatives.git
+git clone https://github.com/VictoriaGailitis/neurocreatives.git
 
 # Создание .env файла
 echo "⚙️  Создание .env файла..."
