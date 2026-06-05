@@ -87,14 +87,24 @@ ssh -i $SSH_KEY $VPS_USER@$VPS_HOST << 'ENDSSH'
             echo "⚠️  Не удалось скачать сертификат. Если используете sslmode=verify-full, установите его вручную."
     fi
 
+    # Выбор Docker Compose: предпочитаем v2-плагин ("docker compose"),
+    # т.к. legacy "docker-compose" v1 (python) ломается с новым requests/urllib3
+    # ошибкой "Not supported URL scheme http+docker".
+    if docker compose version >/dev/null 2>&1; then
+        DC="docker compose"
+    else
+        DC="docker-compose"
+    fi
+    echo "🐳 Используется Compose: $DC"
+
     echo "🐳 Остановка старого контейнера..."
-    docker-compose -f "$COMPOSE_FILE" down || true
+    $DC -f "$COMPOSE_FILE" down || true
 
     echo "🔨 Сборка нового образа..."
-    docker-compose -f "$COMPOSE_FILE" build --no-cache
+    $DC -f "$COMPOSE_FILE" build --no-cache
 
     echo "🚀 Запуск контейнера..."
-    docker-compose -f "$COMPOSE_FILE" up -d
+    $DC -f "$COMPOSE_FILE" up -d
 
     echo "🧹 Очистка старых образов..."
     docker system prune -f
@@ -102,11 +112,11 @@ ssh -i $SSH_KEY $VPS_USER@$VPS_HOST << 'ENDSSH'
     echo "✅ Деплой завершен!"
     echo ""
     echo "📊 Статус контейнера:"
-    docker-compose -f "$COMPOSE_FILE" ps
+    $DC -f "$COMPOSE_FILE" ps
 
     echo ""
     echo "📋 Последние логи:"
-    docker-compose -f "$COMPOSE_FILE" logs --tail=20
+    $DC -f "$COMPOSE_FILE" logs --tail=20
 
     echo ""
     echo "🌐 Приложение доступно на:"

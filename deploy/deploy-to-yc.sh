@@ -48,14 +48,24 @@ ssh -i $SSH_KEY $VPS_USER@$VPS_HOST << 'ENDSSH'
         echo "   - DATABASE_URL"
     fi
     
+    # Выбор Docker Compose: предпочитаем v2-плагин ("docker compose"),
+    # т.к. legacy "docker-compose" v1 (python) ломается с новым requests/urllib3
+    # ошибкой "Not supported URL scheme http+docker".
+    if docker compose version >/dev/null 2>&1; then
+        DC="docker compose"
+    else
+        DC="docker-compose"
+    fi
+    echo "🐳 Используется Compose: $DC"
+
     echo "🐳 Остановка старого контейнера..."
-    docker-compose down || true
+    $DC down || true
     
     echo "🔨 Сборка нового образа..."
-    docker-compose build --no-cache
+    $DC build --no-cache
     
     echo "🚀 Запуск контейнера..."
-    docker-compose up -d
+    $DC up -d
     
     echo "🧹 Очистка старых образов..."
     docker system prune -f
@@ -63,11 +73,11 @@ ssh -i $SSH_KEY $VPS_USER@$VPS_HOST << 'ENDSSH'
     echo "✅ Деплой завершен!"
     echo ""
     echo "📊 Статус контейнера:"
-    docker-compose ps
+    $DC ps
     
     echo ""
     echo "📋 Последние логи:"
-    docker-compose logs --tail=20
+    $DC logs --tail=20
     
     echo ""
     echo "🌐 Приложение доступно на:"
