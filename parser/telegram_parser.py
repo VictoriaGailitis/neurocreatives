@@ -25,19 +25,43 @@ def _build_proxy() -> tuple[object | None, dict | None]:
       • TELEGRAM_PROXY=socks5://host:port             (no auth)
       • TELEGRAM_PROXY=mtproxy://host:port:secret_hex
       • TELEGRAM_PROXY=tg://proxy?secret=...&server=host&port=port  (MTProxy link from Telegram)
+      • TELEGRAM_PROXY=vless://<uuid>@host:port?...#name  (VLESS VPN via local Xray bridge)
+      • TELEGRAM_VPN=vless://...                         (alias, takes priority for VPN links)
       • plus generic HTTPS_PROXY / HTTP_PROXY (treated as http proxy).
 
     No default — proxy must be set via env if needed.
     """
     raw = (
-        os.environ.get("TELEGRAM_PROXY")
+        os.environ.get("TELEGRAM_VPN")
+        or os.environ.get("TELEGRAM_PROXY")
         or os.environ.get("HTTPS_PROXY")
         or os.environ.get("HTTP_PROXY")
     )
     if not raw:
         return None, None
 
+    raw = raw.strip()
+
     from urllib.parse import parse_qs
+
+    # VLESS VPN link — Telethon cannot speak VLESS directly, so we spin up a
+    # local Xray subprocess that exposes a SOCKS5 endpoint and route through it.
+    from parser.vless_bridge import is_vless_link, start_vless_bridge
+
+    if is_vless_link(raw):
+        try:
+            import socks  # PySocks — required for the local SOCKS5 endpoint
+        except ImportError:
+            logger.warning("PySocks required for VLESS VPN: pip install pysocks")
+            return None, None
+        try:
+            local_host, local_port = start_vless_bridge(raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to start VLESS bridge: %s", exc)
+            return None, None
+        logger.info("Using VLESS VPN via local SOCKS5 %s:%s", local_host, local_port)
+        proxy_tuple = (socks.SOCKS5, local_host, local_port, True, None, None)
+        return None, proxy_tuple
 
     parsed = urlparse(raw)
     scheme = (parsed.scheme or "").lower()

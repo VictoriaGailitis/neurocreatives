@@ -45,13 +45,19 @@ def test_with_proxy():
     print("Testing PROXY connection")
     print("=" * 60)
     
-    # Check for proxy settings
-    proxy_env = os.environ.get("TELEGRAM_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    # Check for proxy / VPN settings
+    proxy_env = (
+        os.environ.get("TELEGRAM_VPN")
+        or os.environ.get("TELEGRAM_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+    )
     
     if not proxy_env:
         print("⚠️  No proxy configured in environment")
         return None
     
+    proxy_env = proxy_env.strip()
     print(f"📡 Proxy: {proxy_env}")
     
     # Parse proxy (simplified version)
@@ -62,7 +68,23 @@ def test_with_proxy():
     connection_cls = None
     proxy = None
     
-    if scheme == "mtproxy":
+    # VLESS VPN — start a local Xray bridge that exposes a SOCKS5 endpoint.
+    if scheme == "vless":
+        print("   Type: VLESS VPN (via local Xray → SOCKS5 bridge)")
+        try:
+            from parser.vless_bridge import start_vless_bridge
+            local_host, local_port = start_vless_bridge(proxy_env)
+            print(f"   Local SOCKS5: {local_host}:{local_port}")
+        except Exception as e:
+            print(f"❌ Failed to start VLESS bridge: {e}")
+            return False
+        try:
+            import socks
+            proxy = (socks.SOCKS5, local_host, local_port, True, None, None)
+        except ImportError:
+            print("❌ PySocks not installed (pip install pysocks)")
+            return False
+    elif scheme == "mtproxy":
         # MTProxy format: mtproxy://host:port:secret
         secret = parsed.path.lstrip("/") or parsed.password
         if secret:

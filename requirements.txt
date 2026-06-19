@@ -10,6 +10,8 @@ psycopg[binary]==3.3.3
 
 # Telegram
 telethon==1.43.2
+# SOCKS/HTTP proxy support for Telethon (also used for the VLESS→SOCKS5 bridge)
+pysocks==1.7.1
 
 # AI / OpenAI
 openai==1.10.0
